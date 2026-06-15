@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.ref == 'refs/heads/dev'
+    if: github.ref == 'refs/heads/dev' && github.repository == 'Davidvandijcke/coarse'
     environment: preview-modal
     runs-on: ubuntu-latest
     timeout-minutes: 20
