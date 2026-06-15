@@ -32,13 +32,16 @@ on:
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 concurrency:
   group: supabase-migrate-preview
   cancel-in-progress: false
 
 jobs:
   migrate:
-    if: github.ref == 'refs/heads/dev'
+    if: github.ref == 'refs/heads/dev' && github.repository == 'Davidvandijcke/coarse'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: preview-modal
