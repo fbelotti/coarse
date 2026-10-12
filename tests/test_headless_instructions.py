@@ -26,15 +26,9 @@ def test_bundled_skill_assets_use_ephemeral_uvx_flow() -> None:
         assert "uv tool run --python 3.12 --from ..." in text
         assert "coarse setup" in text
         assert "~/.coarse/config.toml" in text
-        # Pin to the version that will be published with the release PR
-        # that lands this branch on main. See CHANGELOG.md ## Unreleased
-        # "RELEASE BLOCKER" note — DEFAULT_MCP_UVX_FROM and these SKILL.md
-        # files must all flip from the temporary git-ref pin to
-        # ``coarse-ink==1.7.0`` as part of the release cut. The `[mcp]`
-        # extra was dropped to cut the uvx install from ~114 to ~60
-        # packages — the handoff flow does not need fastmcp or
-        # pymupdf4llm.
-        assert "uvx --python 3.12 --from 'coarse-ink==1.7.0'" in text
+        from coarse import __version__
+
+        assert f"uvx --python 3.12 --from 'coarse-ink=={__version__}'" in text
         assert "coarse install-skills --all --force" in text
         # Per-review unique log file: every skill uses a LOG env var
         # derived from a per-paper suffix so parallel runs in the same
@@ -96,6 +90,14 @@ def test_web_handoff_assets_use_shared_uvx_prompt_flow() -> None:
     )
     assert "attachCmd: string;" in handoff_lib
     assert "rg '^  view:|^  local:' ${logFile}" in handoff_lib
+    # The opt-in deep-literature choice must survive subscription handoff just
+    # as it does the hosted submit path. Pin both the command builder contract
+    # and the conditional CLI suffix so a UI refactor cannot silently drop it.
+    assert "deepLiteratureSearch?: boolean;" in handoff_lib
+    assert "const deepSuffix = deepLiteratureSearch ?" in handoff_lib
+    assert '" --deep-literature-search" : "";' in handoff_lib
+    assert "${effort}${deepSuffix}`;" in handoff_lib
+    assert handoff_page.count("deepLiteratureSearch,") >= 6
 
     # page.tsx must pass logFile + attachCmd through to buildAgentPrompt
     # on every call site (handleLaunch + the collapsible manual-commands UI).
@@ -104,7 +106,10 @@ def test_web_handoff_assets_use_shared_uvx_prompt_flow() -> None:
     # flag (#186): two buildAgentPrompt call sites + buildLaunchUrl. See
     # test_handoff_key_guidance_is_pdf_conditional for the branch content.
     assert handoff_page.count("isPdf: handoffState.isPdf") >= 3
-    assert "coarse.ink does not receive or store your" in handoff_page
+    # The disclaimer copy was externalized to the i18n catalog in PR-H (site UI
+    # localization); page.tsx now references it via t("explainDisclaimer"). Assert
+    # the copy survives in the English catalog rather than inline in page.tsx.
+    assert "coarse.ink does not receive or store your" in _read("web/src/lib/i18n/en.ts")
 
     # The /h/<token> landing-page HTML renderer shares its core runCmd
     # derivation with `buildCliCommands` via `buildHandoffLandingCommands`
@@ -129,18 +134,19 @@ def test_web_handoff_assets_use_shared_uvx_prompt_flow() -> None:
     # as part of the release cut. The release-blocker coupling test
     # in `test_release_blocker_pin_is_coupled_to_unreleased_version`
     # enforces that this pin matches `__version__`.
-    assert '"coarse-ink==1.7.0"' in handoff_lib
+    from coarse import __version__
+
+    assert f'"coarse-ink=={__version__}"' in handoff_lib
     assert "@feat/mcp-server" not in handoff_lib
     assert "@feat/mcp-server" not in handoff_route
 
 
-def test_handoff_key_guidance_is_pdf_conditional() -> None:
-    """Issue #186: only PDF sources run Mistral OCR, so only PDF handoffs
-    may tell the agent (or the user) to configure an OpenRouter key.
+def test_handoff_key_guidance_tracks_pdf_or_deep_search() -> None:
+    """Issue #186: PDF OCR and opt-in deep search require OpenRouter.
 
-    Non-PDF sources (.tex, .md, .docx, …) extract locally with no key
-    anywhere in the pipeline — the literature search falls back to the
-    free arXiv path when no key is set. Before this gate,
+    Standard non-PDF sources (.tex, .md, .docx, …) extract locally and can
+    use the free arXiv fallback. Deep search cannot, so it must override the
+    otherwise key-free non-PDF branch. Before this gate,
     ``buildAgentPrompt``'s STEP 2 unconditionally instructed the coding
     agent to stop and ask the user for an OpenRouter key, blocking
     key-free .tex reviews on a key that would never be used. Pin every
@@ -151,11 +157,14 @@ def test_handoff_key_guidance_is_pdf_conditional() -> None:
     handoff_page = _read("web/src/app/page.tsx")
     handoff_route = _read("web/src/app/h/[token]/route.ts")
 
-    # buildAgentPrompt takes the flag and branches STEP 2 on it.
+    # buildAgentPrompt takes both flags and branches STEP 2 on either need.
     assert "isPdf: boolean;" in handoff_lib
-    assert "const step2 = isPdf" in handoff_lib
+    assert "const needsOpenRouterKey = isPdf || deepLiteratureSearch;" in handoff_lib
+    assert "const step2 = needsOpenRouterKey" in handoff_lib
     # PDF branch: the key request must still exist verbatim.
-    assert "I need an OpenRouter API key for the Mistral OCR extraction step" in handoff_lib
+    assert "I need an OpenRouter API key for PDF processing" in handoff_lib
+    assert "triggered vision QA" in handoff_lib
+    assert "requested Perplexity deep literature search" in handoff_lib
     # Non-PDF branch: explicit no-key + do-not-ask instruction.
     assert "No OpenRouter API key is needed for this review" in handoff_lib
     assert "ask me for an OpenRouter key" in handoff_lib
@@ -165,26 +174,33 @@ def test_handoff_key_guidance_is_pdf_conditional() -> None:
     # after minting can't flip the guidance for an existing handoff.
     assert 'isPdf: file.name.toLowerCase().endsWith(".pdf")' in handoff_page
     # And the modal + explainer copy branch on it.
-    assert "handoffState.isPdf ?" in handoff_page
+    assert "handoffState.isPdf || deepLiteratureSearch ?" in handoff_page
     assert "selectedFileIsPdf" in handoff_page
-    assert "No OpenRouter key needed for this paper" in handoff_page
+    # The non-PDF no-key note copy was externalized to the i18n catalog in PR-H;
+    # page.tsx branches on selectedFileIsPdf and renders t("handoffKeyNotNeeded").
+    assert "No OpenRouter key needed for this paper" in _read("web/src/lib/i18n/en.ts")
 
     # The /h/<token> landing page derives the flag from the stored
     # filename extension and renders the matching key note.
     assert 'isPdf: ext === ".pdf"' in handoff_route
     assert "No OpenRouter key needed:" in handoff_route
     assert "OpenRouter key:</strong> PDF sources use Mistral OCR" in handoff_route
+    assert "vision-QA call" in handoff_route
 
-    # The three bundled skills gate their key section on PDF too.
+    # The three bundled skills gate the standard key requirement on PDFs and
+    # also explain that explicit deep search needs a key for every format.
     for skill in (
         "src/coarse/_skills/claude_code/SKILL.md",
         "src/coarse/_skills/codex/SKILL.md",
         "src/coarse/_skills/gemini_cli/SKILL.md",
     ):
         text = _read(skill)
-        assert "OpenRouter API key required for PDF papers only" in text, skill
-        assert "If the paper is a PDF and neither probe reports" in text, skill
-        assert "never block a non-PDF review on a missing key" in text, skill
+        assert (
+            "OpenRouter API key required for PDF papers or an explicitly "
+            "requested deep literature search"
+        ) in text, skill
+        assert "`--deep-literature-search` uses Perplexity Sonar Deep Research" in text, skill
+        assert "If the paper is a PDF or deep literature was requested" in text, skill
 
 
 def test_submit_route_handoff_retry_checks_review_status() -> None:

@@ -1,21 +1,43 @@
 """Tests for coarse.models — model manifest invariants."""
 
+import re
+from pathlib import Path
+
 import pytest
 
 from coarse.models import (
     _NON_REASONING_SUBSTRINGS,
     CHEAP_MODELS,
+    CLAUDE_FABLE_5_MODEL,
+    CLAUDE_OPUS_5_MODEL,
+    CLAUDE_SONNET_5_MODEL,
     DEFAULT_MODEL,
+    DIRECT_RESPONSES_MODEL_ALIASES,
+    FUSION_INPUT_COST_PER_TOKEN,
+    FUSION_MODEL,
+    FUSION_OUTPUT_COST_PER_TOKEN,
+    GEMINI_3_6_FLASH_MODEL,
+    GPT_5_6_LUNA_MODEL,
+    GPT_5_6_SOL_MODEL,
+    GPT_5_6_TERRA_MODEL,
+    GPT_6_SOL_MODEL,
+    GROK_4_5_MODEL,
+    HEADLESS_DEFAULT_MODELS,
     JSON_MODE_PREFIXES,
+    KIMI_K3_MODEL,
     MARKDOWN_JSON_PREFIXES,
     OCR_MODEL,
+    OPENROUTER_NAMESPACE_MODELS,
     QUALITY_MODEL,
+    QWEN_3_7_PLUS_MODEL,
     REASONING_EFFORT_DEFAULT,
     REASONING_MAX_TOKENS_MULTIPLIER,
     REASONING_MODEL_PREFIXES,
     REASONING_MODEL_SUBSTRINGS,
     TEMPERATURE_UNSUPPORTED_PREFIXES,
     VISION_MODEL,
+    WEB_DEFAULT_MODEL,
+    WEB_FEATURED_MODEL_IDS,
     is_reasoning_model,
     model_filename_slug,
     supports_temperature,
@@ -24,6 +46,74 @@ from coarse.models import (
 
 def test_default_model_has_provider_prefix():
     assert "/" in DEFAULT_MODEL
+
+
+def test_current_frontier_model_manifest_is_canonical():
+    """The runtime registry exposes provider-qualified current model IDs."""
+    assert DEFAULT_MODEL == QWEN_3_7_PLUS_MODEL
+    for model_id in (
+        CLAUDE_FABLE_5_MODEL,
+        CLAUDE_OPUS_5_MODEL,
+        CLAUDE_SONNET_5_MODEL,
+        GPT_5_6_SOL_MODEL,
+        GPT_5_6_TERRA_MODEL,
+        GPT_5_6_LUNA_MODEL,
+        GEMINI_3_6_FLASH_MODEL,
+        QWEN_3_7_PLUS_MODEL,
+        KIMI_K3_MODEL,
+        GROK_4_5_MODEL,
+    ):
+        assert "/" in model_id
+
+
+def test_web_picker_tracks_canonical_featured_models_and_default():
+    """Fail if the cross-language web picker drifts from the Python manifest."""
+    picker_path = Path(__file__).resolve().parents[1] / "web/src/components/ModelPicker.tsx"
+    picker = picker_path.read_text(encoding="utf-8")
+
+    default_match = re.search(r'export const DEFAULT_REVIEW_MODEL\s*=\s*"([^"]+)";', picker)
+    assert default_match, "DEFAULT_REVIEW_MODEL is missing from ModelPicker.tsx"
+    web_default = default_match.group(1)
+
+    models_match = re.search(
+        r"const DEFAULT_MODELS:\s*DefaultModel\[\]\s*=\s*\[(.*?)\n\];",
+        picker,
+        flags=re.DOTALL,
+    )
+    assert models_match, "DEFAULT_MODELS is missing from ModelPicker.tsx"
+    id_expressions = re.findall(r"\{\s*id:\s*([^,]+),", models_match.group(1))
+    web_ids: list[str] = []
+    for expression in id_expressions:
+        expression = expression.strip()
+        if expression == "DEFAULT_REVIEW_MODEL":
+            web_ids.append(web_default)
+            continue
+        literal = re.fullmatch(r'"([^"]+)"', expression)
+        assert literal, f"unsupported model ID expression in picker: {expression}"
+        web_ids.append(literal.group(1))
+
+    assert web_default == WEB_DEFAULT_MODEL
+    assert tuple(web_ids) == WEB_FEATURED_MODEL_IDS
+
+
+def test_headless_defaults_track_current_host_models():
+    assert HEADLESS_DEFAULT_MODELS == {
+        "claude": "claude-opus-5-5",
+        "codex": GPT_6_SOL_MODEL.removeprefix("openai/"),
+        "gemini": GEMINI_3_6_FLASH_MODEL.removeprefix("google/"),
+    }
+
+
+def test_current_default_reasoning_models_get_hidden_token_headroom():
+    for model_id in (
+        CLAUDE_FABLE_5_MODEL,
+        CLAUDE_OPUS_5_MODEL,
+        CLAUDE_SONNET_5_MODEL,
+        GEMINI_3_6_FLASH_MODEL,
+        QWEN_3_7_PLUS_MODEL,
+        KIMI_K3_MODEL,
+    ):
+        assert is_reasoning_model(model_id), model_id
 
 
 def test_all_models_have_provider_prefix():
@@ -38,6 +128,26 @@ def test_all_models_have_provider_prefix():
 def test_cheap_models_have_provider_prefix():
     for env_var, model_id in CHEAP_MODELS.items():
         assert "/" in model_id, f"CHEAP_MODELS[{env_var}] missing prefix: {model_id}"
+
+
+def test_fusion_model_is_in_openrouter_namespace_set():
+    # The double-prefix routing fix in llm._normalize_model keys off this set.
+    assert FUSION_MODEL in OPENROUTER_NAMESPACE_MODELS
+
+
+def test_openrouter_namespace_models_are_single_segment_openrouter_slugs():
+    # These need doubling precisely because they are `openrouter/<model>` with
+    # no further provider segment (which would already carry the routing prefix).
+    for model_id in OPENROUTER_NAMESPACE_MODELS:
+        assert model_id.startswith("openrouter/"), model_id
+        assert model_id.count("/") == 1, model_id
+
+
+def test_fusion_representative_pricing_is_positive():
+    # OpenRouter reports dynamic (-1) pricing; these are the substitute rates
+    # the cost estimators rely on, so they must be real positive numbers.
+    assert FUSION_INPUT_COST_PER_TOKEN > 0
+    assert FUSION_OUTPUT_COST_PER_TOKEN > 0
 
 
 def test_json_and_markdown_prefixes_no_overlap():
@@ -265,10 +375,17 @@ def test_supports_temperature_false_for_claude_fable_5():
     """Claude Fable 5 drops temperature like the recent Opus models (issue
     #214; verified on OpenRouter — supported_parameters has no temperature).
     The name has no version dot, so all ID forms are identical."""
-    assert supports_temperature("anthropic/claude-fable-5") is False
+    assert supports_temperature(CLAUDE_FABLE_5_MODEL) is False
     assert supports_temperature("openrouter/anthropic/claude-fable-5") is False
     assert supports_temperature("vertex_ai/claude-fable-5") is False
     assert supports_temperature("claude-fable-5") is False
+
+
+def test_supports_temperature_for_claude_5_models():
+    """OpenRouter exposes temperature for Opus 5 but not Sonnet 5."""
+    assert supports_temperature(CLAUDE_OPUS_5_MODEL) is True
+    assert supports_temperature(CLAUDE_SONNET_5_MODEL) is False
+    assert supports_temperature(f"openrouter/{CLAUDE_SONNET_5_MODEL}") is False
 
 
 def test_supports_temperature_true_for_opus_4_6():
@@ -295,3 +412,76 @@ def test_supports_temperature_true_for_common_models(model_id):
 def test_temperature_unsupported_prefixes_are_lowercase():
     for p in TEMPERATURE_UNSUPPORTED_PREFIXES:
         assert p == p.lower(), f"unsupported-temperature prefix not lowercase: {p}"
+
+
+def test_direct_responses_aliases_map_bare_variant_ids_to_canonical_targets():
+    """The direct Responses alias in llm.py depends on three invariants:
+    keys are bare (un-proxied) IDs so an openrouter/-prefixed model can never
+    match, and each target is a canonical registered ID whose pricing/limits
+    are registered, with an explicit reasoning mode."""
+    for variant, (target, request_body) in DIRECT_RESPONSES_MODEL_ALIASES.items():
+        assert not variant.startswith("openrouter/"), variant
+        assert not target.startswith("openrouter/"), target
+        assert variant != target, variant
+        from coarse.llm import model_cost_per_token
+
+        assert all(rate > 0 for rate in model_cost_per_token(target)), target
+        assert request_body.get("reasoning", {}).get("mode"), variant
+        assert request_body.get("store") is False, variant
+
+
+def test_latest_featured_models_have_reasoning_and_temperature_metadata():
+    from coarse.models import (
+        CLAUDE_FABLE_5_1_MODEL,
+        GEMINI_3_8_FLASH_MODEL,
+        GPT_6_ASTRA_MODEL,
+        GPT_6_ASTRA_PRO_MODEL,
+        QWEN_3_8_MAX_MODEL,
+    )
+
+    for model in (
+        GPT_6_ASTRA_MODEL,
+        GPT_6_ASTRA_PRO_MODEL,
+        CLAUDE_FABLE_5_1_MODEL,
+        GEMINI_3_8_FLASH_MODEL,
+        QWEN_3_8_MAX_MODEL,
+    ):
+        assert is_reasoning_model("openrouter/" + model)
+    for model in (GPT_6_ASTRA_MODEL, GPT_6_ASTRA_PRO_MODEL, CLAUDE_FABLE_5_1_MODEL):
+        assert not supports_temperature("openrouter/" + model)
+
+
+def test_astra_cost_registry_preserves_long_context_surcharge():
+    from coarse.llm import model_cost_per_token
+    from coarse.models import GPT_6_ASTRA_MODEL, GPT_6_ASTRA_PRO_MODEL, LONG_CONTEXT_PRICING_TIERS
+
+    for model in (GPT_6_ASTRA_MODEL, GPT_6_ASTRA_PRO_MODEL):
+        assert model_cost_per_token("openrouter/" + model) == (10e-6, 50e-6)
+        assert LONG_CONTEXT_PRICING_TIERS[model] == {
+            "min_prompt_tokens": 272_000,
+            "input_cost_per_token": 20e-6,
+            "output_cost_per_token": 75e-6,
+        }
+
+
+@pytest.mark.parametrize(
+    "model, rates, long_rates",
+    [
+        ("openai/gpt-6-sol", (2e-6, 10e-6), (4e-6, 15e-6)),
+        ("openai/gpt-6.1-sol", (2e-6, 10e-6), (4e-6, 15e-6)),
+        ("openai/gpt-6-luna", (0.1e-6, 0.5e-6), (0.2e-6, 0.75e-6)),
+        ("x-ai/grok-4.7", (2e-6, 6e-6), (4e-6, 12e-6)),
+        ("z-ai/glm-5.3", (0.05e-6, 7e-6), (0.05e-6, 7e-6)),
+        ("anthropic/claude-opus-5.5", (4e-6, 20e-6), (4e-6, 20e-6)),
+        ("anthropic/claude-sonnet-5.5", (2e-6, 10e-6), (2e-6, 10e-6)),
+    ],
+)
+def test_october_models_preserve_reasoning_budgets_and_costs(model, rates, long_rates):
+    from coarse.llm import model_cost_per_token
+
+    routed = "openrouter/" + model
+    assert is_reasoning_model(routed)
+    assert model_cost_per_token(routed) == rates
+    assert model_cost_per_token(routed, prompt_tokens=300_000) == long_rates
+    if model.startswith("openai/"):
+        assert not supports_temperature(routed)

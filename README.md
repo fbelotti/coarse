@@ -5,12 +5,13 @@
 [![Downloads](https://img.shields.io/endpoint?url=https%3A%2F%2Fcoarse.ink%2Fapi%2Fdownloads)](https://pypistats.org/packages/coarse-ink)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/github/license/Davidvandijcke/coarse)](LICENSE)
+[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-FFDD00?logo=buymeacoffee&logoColor=000000)](https://buymeacoffee.com/coarse)
 
 Free, open-source AI academic paper reviewer that outperforms popular paid AI reviewers.
 
 You provide your own API key and pay the LLM provider directly — typically **under $2 per review**.
 
-Don't want to run it locally? Use the [web interface](https://coarse.vercel.app/) instead.
+Don't want to run it locally? Use the [web interface](https://coarse.ink/) instead.
 
 ## Quickstart
 
@@ -59,17 +60,19 @@ Or run `coarse setup` to store keys in `~/.coarse/config.toml`.
 ## Use your coding-agent subscription
 
 If you already have a `claude`, `codex`, or `gemini` CLI logged into its subscription,
-`coarse-review` routes every pipeline LLM call through the local CLI (`claude -p`,
-`codex exec`, `gemini -p`) so reviews bill your Claude Max / ChatGPT Pro / Google AI Pro
-subscription instead of a pay-per-token API. Only the ~$0.05–0.15 Mistral OCR step on
-PDF sources still uses `OPENROUTER_API_KEY` (skip it with `--pre-extracted paper.md`).
+`coarse-review` routes review reasoning through the local CLI (`claude -p`,
+`codex exec`, `gemini -p`) so it bills your Claude Max / ChatGPT Pro / Google AI Pro
+subscription instead of a pay-per-token API. PDF sources still use `OPENROUTER_API_KEY`
+for the ~$0.05–0.15 Mistral OCR step and for a small post-extraction vision-QA charge
+when that check runs (skip OCR with `--pre-extracted paper.md`).
 Non-PDF sources (`.tex`, `.md`, `.txt`, `.docx`, `.html`, `.epub`) extract locally, so
 they run entirely on your subscription with no OpenRouter key at all.
 
 ```bash
 coarse-review paper.pdf                          # auto-detects claude → codex → gemini
-coarse-review paper.pdf --host codex --model gpt-5.5
+coarse-review paper.pdf --host codex --model gpt-5.6-sol
 coarse-review paper.tex                          # .tex/.md/...: no OpenRouter key needed
+coarse-review paper.tex --deep-literature-search # deeper Perplexity pass (key required)
 ```
 
 Run `coarse install-skills` to register a `/coarse-review` skill in each CLI's skills
@@ -93,7 +96,7 @@ paper.pdf (or .txt, .md, .tex, .docx, .html, .epub)
   -> Mistral OCR (Docling fallback)      Extract text as markdown
   -> Vision LLM spot-check               Optional QA (auto-triggers on garbled text)
   -> Structure analysis                   Parse sections, detect math content, classify domain
-  -> Domain calibration + lit search      Parallel: domain-specific criteria + Perplexity Sonar Pro
+  -> Domain calibration + lit search      Parallel: criteria + Perplexity Pro/optional Deep Research
   -> Overview agent                       Single macro-level review pass
   -> Completeness agent                   Structural-gap pass merged into overview
   -> Section agents + proof verification  Parallel: 15-25 detailed comments; math sections get adversarial proof check
@@ -106,7 +109,10 @@ paper.pdf (or .txt, .md, .tex, .docx, .html, .epub)
 
 The pipeline extracts text, classifies the paper's domain and structure, then generates
 domain-specific review criteria and searches for related literature (via
-[Perplexity Sonar Pro](https://docs.perplexity.ai/), with arXiv fallback). A single
+[Perplexity Sonar Pro Search](https://docs.perplexity.ai/), with arXiv fallback).
+Pass `--deep-literature-search` to use Sonar Deep Research for a broader, multi-step
+source search. It normally adds about $0.30 to the buffered estimate and can take a few
+minutes; the standard pass remains the default. A single
 overview pass produces macro-level feedback, completeness can add structural gaps, and
 section agents run in parallel with adversarial proof verification for math-heavy sections.
 A conditional cross-section pass checks whether discussion claims are supported by formal
@@ -120,11 +126,13 @@ Pass any litellm-compatible model string with `--model`:
 
 ```bash
 coarse review paper.pdf --model openai/gpt-4o
-coarse review paper.pdf --model anthropic/claude-sonnet-4-6
+coarse review paper.pdf --model anthropic/claude-sonnet-5
 coarse review paper.pdf --model gemini/gemini-3-flash-preview
 ```
 
-The default model is `qwen/qwen3.5-plus-02-15` routed via [OpenRouter](https://openrouter.ai).
+The package default is `qwen/qwen3.7-plus` routed via [OpenRouter](https://openrouter.ai).
+The coarse.ink form defaults to Claude Opus 5 and also features Sonnet 5, GPT-5.6,
+Gemini 3.6 Flash, Kimi K3, Grok 4.5, and other current frontier models.
 Any model supported by [litellm](https://docs.litellm.ai/docs/providers) works.
 With only `OPENROUTER_API_KEY` set, all models (including vision QA) route through OpenRouter automatically.
 
@@ -135,7 +143,7 @@ Use `--cheap` to automatically select the cheapest model for which you have an A
 Only `OPENROUTER_API_KEY` is needed. This covers everything: review agents,
 literature search, and PDF extraction (Mistral OCR is always routed through
 OpenRouter's file-parser plugin, so there's no separate key for it). For
-step-by-step setup instructions, see the [API key guide](https://coarse.vercel.app/setup).
+step-by-step setup instructions, see the [API key guide](https://coarse.ink/setup).
 
 > **Set your OpenRouter per-key spend limit to at least $10** (ideally matching
 > the `max_cost_usd` default of `$10`). If the limit is hit mid-review the run
@@ -229,7 +237,7 @@ supported file format (PDF, TXT, MD, TeX, DOCX, HTML, EPUB).
 Settings are stored in `~/.coarse/config.toml`:
 
 ```toml
-default_model = "qwen/qwen3.5-plus-02-15"
+default_model = "qwen/qwen3.7-plus"
 vision_model = "gemini/gemini-3-flash-preview"
 extraction_qa = true
 max_cost_usd = 10.0
@@ -256,7 +264,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, project structure,
 
 ## Version
 
-1.7.0
+1.9.6
 
 ## License
 

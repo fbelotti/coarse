@@ -2,20 +2,45 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 
+import { formatPromptPrice } from "@/lib/estimateCost";
+import { useSiteLanguageContext } from "@/lib/i18n";
+
 /* ── Default model options ─────────────────────────────────── */
-const DEFAULT_MODELS = [
-  { id: "anthropic/claude-fable-5", label: "Fable 5", provider: "Anthropic" },
-  { id: "anthropic/claude-opus-4.8", label: "Opus 4.8", provider: "Anthropic" },
-  { id: "anthropic/claude-sonnet-4.6", label: "Sonnet 4.6", provider: "Anthropic" },
-  { id: "openai/gpt-5.5", label: "GPT-5.5", provider: "OpenAI" },
-  { id: "openai/gpt-5-mini", label: "GPT-5 Mini", provider: "OpenAI" },
+type DefaultModel = {
+  id: string;
+  label: string;
+  provider: string;
+  /** Render greyed-out and non-selectable (model temporarily unavailable). */
+  unavailable?: boolean;
+  /** Append a smaller "(provider)" suffix to the chip, e.g. "Fusion (OpenRouter)". */
+  showProvider?: boolean;
+};
+
+/** Canonical web-review default, shared by the landing form and review chat. */
+export const DEFAULT_REVIEW_MODEL = "anthropic/claude-opus-5.5";
+
+const DEFAULT_MODELS: DefaultModel[] = [
+  { id: "anthropic/claude-fable-5.1", label: "Fable 5.1", provider: "Anthropic" },
+  { id: DEFAULT_REVIEW_MODEL, label: "Opus 5.5", provider: "Anthropic" },
+  { id: "anthropic/claude-sonnet-5.5", label: "Sonnet 5.5", provider: "Anthropic" },
+  { id: "openai/gpt-6-astra", label: "GPT-6 Astra", provider: "OpenAI" },
+  { id: "openai/gpt-6-astra-pro", label: "GPT-6 Astra Pro", provider: "OpenAI" },
+  { id: "openai/gpt-6.1-sol", label: "GPT-6.1 Sol", provider: "OpenAI" },
+  { id: "openai/gpt-6-sol", label: "GPT-6 Sol", provider: "OpenAI" },
+  { id: "openai/gpt-6-luna", label: "GPT-6 Luna", provider: "OpenAI" },
   { id: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro", provider: "Google" },
-  { id: "google/gemini-3.5-flash", label: "Gemini 3.5 Flash", provider: "Google" },
-  { id: "qwen/qwen3.7-plus", label: "Qwen 3.7 Plus", provider: "Qwen" },
-  { id: "moonshotai/kimi-k2.6", label: "Kimi K2.6", provider: "Moonshot" },
+  { id: "google/gemini-3.8-flash", label: "Gemini 3.8 Flash", provider: "Google" },
+  { id: "qwen/qwen3.8-max-0902", label: "Qwen 3.8 Max", provider: "Qwen" },
+  { id: "moonshotai/kimi-k3", label: "Kimi K3", provider: "Moonshot" },
   { id: "deepseek/deepseek-v4-pro", label: "DeepSeek V4", provider: "DeepSeek" },
-  { id: "x-ai/grok-4.3", label: "Grok 4.3", provider: "xAI" },
+  { id: "x-ai/grok-4.7", label: "Grok 4.7", provider: "xAI" },
   { id: "meta-llama/llama-4-maverick", label: "Llama 4 Maverick", provider: "Meta" },
+  { id: "z-ai/glm-5.3", label: "GLM 5.3", provider: "Z.ai" },
+  // OpenRouter Fusion: a multi-model deliberation panel with web search.
+  // Higher latency and variable (usage-based) cost than a single model — see
+  // the FUSION_MODEL note in src/coarse/models.py. showProvider tags the chip
+  // "(OpenRouter)" since "Fusion" alone is less self-explanatory than e.g. "Opus 5.5".
+  { id: "openrouter/fusion", label: "Fusion", provider: "OpenRouter", showProvider: true },
 ];
 
 interface OpenRouterModel {
@@ -33,6 +58,7 @@ function SearchModal({
   onSelect: (id: string, label: string) => void;
   onClose: () => void;
 }) {
+  const { t } = useSiteLanguageContext();
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<OpenRouterModel[]>([]);
   const [allModels, setAllModels] = useState<OpenRouterModel[]>([]);
@@ -83,10 +109,9 @@ function SearchModal({
   function formatPrice(model: OpenRouterModel): string {
     const p = model.pricing;
     if (!p?.prompt) return "";
-    const promptCost = parseFloat(p.prompt) * 1_000_000;
-    if (promptCost === 0) return "free";
-    if (promptCost < 1) return `$${promptCost.toFixed(2)}/M`;
-    return `$${promptCost.toFixed(0)}/M`;
+    // Shared with the cost estimator: shows "variable" for dynamic ("-1")
+    // prices, "free" for 0, "$X/M" otherwise.
+    return formatPromptPrice(parseFloat(p.prompt));
   }
 
   return (
@@ -123,7 +148,7 @@ function SearchModal({
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search models..."
+            placeholder={t("modelPickerSearchPlaceholder")}
             className="field-line-mono"
             style={{ width: "100%", fontSize: "1rem" }}
           />
@@ -141,7 +166,7 @@ function SearchModal({
                 fontSize: "1.1rem",
               }}
             >
-              Loading models...
+              {t("modelPickerLoading")}
             </p>
           ) : results.length === 0 ? (
             <p
@@ -153,7 +178,7 @@ function SearchModal({
                 fontSize: "1.1rem",
               }}
             >
-              No models found.
+              {t("modelPickerNoResults")}
             </p>
           ) : (
             results.map((m) => (
@@ -233,6 +258,7 @@ export default function ModelPicker({
   value: string;
   onChange: (modelId: string) => void;
 }) {
+  const { t } = useSiteLanguageContext();
   const [showSearch, setShowSearch] = useState(false);
   const [customLabel, setCustomLabel] = useState<string | null>(null);
 
@@ -261,34 +287,44 @@ export default function ModelPicker({
           marginBottom: "0.5rem",
         }}
       >
-        Model
+        {t("modelPickerLabel")}
       </span>
 
       <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
         {DEFAULT_MODELS.map((m) => {
           const selected = value === m.id;
+          const unavailable = m.unavailable === true;
           return (
             <button
               key={m.id}
               type="button"
+              disabled={unavailable}
+              title={unavailable ? t("modelPickerUnavailableTitle") : undefined}
               onClick={() => {
+                if (unavailable) return;
                 onChange(m.id);
                 setCustomLabel(null);
               }}
               style={{
                 padding: "0.4rem 0.85rem",
                 background: selected ? "var(--yellow-chalk)" : "var(--board-surface)",
-                color: selected ? "var(--board)" : "var(--chalk)",
+                color: unavailable ? "var(--dust)" : selected ? "var(--board)" : "var(--chalk)",
                 border: `1px solid ${selected ? "var(--yellow-chalk)" : "var(--tray)"}`,
                 borderRadius: "2px",
                 fontFamily: "var(--font-space-mono), monospace",
                 fontSize: "1.1rem",
-                cursor: "pointer",
+                cursor: unavailable ? "not-allowed" : "pointer",
+                opacity: unavailable ? 0.45 : 1,
                 transition: "all 0.15s",
                 whiteSpace: "nowrap",
               }}
             >
               {m.label}
+              {m.showProvider && (
+                <span style={{ fontSize: "0.78em", opacity: 0.7, marginLeft: "0.3rem" }}>
+                  ({m.provider})
+                </span>
+              )}
             </button>
           );
         })}
@@ -309,7 +345,7 @@ export default function ModelPicker({
             whiteSpace: "nowrap",
           }}
         >
-          {!isDefault && value ? displayLabel : "search models..."}
+          {!isDefault && value ? displayLabel : t("modelPickerSearch")}
         </button>
       </div>
 

@@ -14,11 +14,11 @@ Two modes:
    local markdown file in ``./coarse-output/``.
 
 2. **Handoff mode** — ``coarse-review --handoff <url>`` pulls a handoff
-   bundle minted by the coarse.vercel.app web form (paper download URL
+   bundle minted by the coarse.ink web form (paper download URL
    + finalize token + callback URL). Extraction still happens locally
    (faster than waiting on the server, same PDF-only key rule); the
    final review gets POSTed back to ``/api/mcp-finalize`` so the user
-   can see it at ``coarse.vercel.app/review/<paper_id>`` in the normal
+   can see it at ``coarse.ink/review/<paper_id>`` in the normal
    web UI.
 """
 
@@ -42,6 +42,7 @@ from coarse.cli_attach import (
     write_pidfile,
 )
 from coarse.extraction import SUPPORTED_EXTENSIONS
+from coarse.handoff_url import handoff_url_argument, normalize_handoff_url
 from coarse.models import HEADLESS_DEFAULT_MODELS, model_filename_slug
 
 _DETACHED_ENV = "COARSE_REVIEW_DETACHED"
@@ -136,14 +137,13 @@ def _infer_handoff_extension(
 def _fetch_handoff(url: str) -> dict:
     """Fetch the handoff bundle JSON from ``url``.
 
-    Accepts either the short form ``coarse.vercel.app/h/<token>`` or
-    ``https://coarse.vercel.app/h/<token>``. The endpoint returns the
+    Accepts either the short form ``coarse.ink/h/<token>`` or
+    ``https://coarse.ink/h/<token>``. The endpoint returns the
     bundle as JSON.
     """
     import requests
 
-    if not url.startswith(("http://", "https://")):
-        url = f"https://{url}"
+    url = normalize_handoff_url(url)
 
     # Ask for JSON explicitly — the /h/<token> route serves a landing
     # page to browsers and JSON to API clients that request it.
@@ -240,8 +240,9 @@ def _post_finalize(
     markdown: str,
     paper_markdown: str,
     host_label: str,
+    language: dict[str, str] | None = None,
 ) -> dict:
-    """POST the rendered review back to coarse.vercel.app/api/mcp-finalize.
+    """POST the rendered review back to coarse.ink/api/mcp-finalize.
 
     Retries up to ``_POST_FINALIZE_MAX_ATTEMPTS`` times on transient
     failure classes (connection error, timeout, 429, 5xx) with
@@ -270,6 +271,11 @@ def _post_finalize(
         "paper_markdown": paper_markdown,
         "model": f"coarse-review-cli:{host_label}",
     }
+    # Forward the resolved review-output language so the finalize route persists
+    # the language columns (otherwise a `--language Arabic` handoff renders
+    # LTR with no badge). Empty values are skipped server-side.
+    if language:
+        payload.update({k: v for k, v in language.items() if v})
 
     last_exc: Exception | None = None
     last_status: int | None = None
@@ -486,8 +492,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--handoff",
+        type=handoff_url_argument,
         metavar="URL",
-        help="Handoff URL from the coarse web form (coarse.vercel.app/h/<token>).",
+        help="Handoff URL from the coarse web form (coarse.ink/h/<token>).",
     )
     parser.add_argument(
         "--host",
@@ -498,14 +505,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--model",
         default=None,
-        help="Host-specific model ID (e.g. claude-sonnet-4-6, gpt-5, gemini-3-flash). "
-        "Defaults to the host's canonical model.",
+        help="Host-specific model ID (e.g. claude-opus-5, gpt-5.6-sol, "
+        "gemini-3.6-flash). Defaults to the host's canonical model.",
     )
     parser.add_argument(
         "--effort",
         choices=["low", "medium", "high", "max"],
         default="high",
         help="Reasoning effort level (default: high)",
+    )
+    parser.add_argument(
+        "--language",
+        default=None,
+        help="Language for the review output (e.g. 'Spanish', 'French', "
+        "'Simplified Chinese'); default English. Quotes stay in the paper's "
+        "original language.",
+    )
+    parser.add_argument(
+        "--deep-literature-search",
+        action="store_true",
+        help="Use Perplexity Sonar Deep Research for a more exhaustive literature pass.",
     )
     parser.add_argument(
         "--output-dir",
@@ -677,7 +696,11 @@ def main(argv: list[str] | None = None) -> int:
         # in --detach mode left a near-empty log and a bare exit code.
         from coarse.headless_review import openrouter_key_preflight_error
 
-        key_error = openrouter_key_preflight_error(paper_path, pre_extracted_path)
+        key_error = openrouter_key_preflight_error(
+            paper_path,
+            pre_extracted_path,
+            deep_literature_search=args.deep_literature_search,
+        )
         if key_error:
             print(key_error, file=sys.stderr)
             return 3
@@ -714,13 +737,16 @@ def main(argv: list[str] | None = None) -> int:
                 handoff_signed_url = raw_signed_url
         signed_url_token = signed_url_ctx.set(handoff_signed_url)
         try:
-            review, md_text, paper_text = run_headless_review(
-                paper_path,
-                host=host,
-                model=model,
-                effort=effort,
-                pre_extracted=pre_extracted_path,
-            )
+            headless_kwargs = {
+                "host": host,
+                "model": model,
+                "effort": effort,
+                "pre_extracted": pre_extracted_path,
+                "language": args.language,
+            }
+            if args.deep_literature_search:
+                headless_kwargs["deep_literature_search"] = True
+            review, md_text, paper_text = run_headless_review(paper_path, **headless_kwargs)
         except Exception as exc:
             # Scrub the exception string before printing — if any upstream
             # helper ever interpolates a URL or token into its error, this
@@ -764,6 +790,19 @@ def main(argv: list[str] | None = None) -> int:
                     len(paper_markdown),
                 )
 
+                # Carry the resolved review-output language (if any) so the
+                # finalize route can persist the language columns.
+                language_fields: dict[str, str] | None = None
+                if review.language is not None:
+                    lc = review.language
+                    language_fields = {
+                        "site_language": lc.site_language,
+                        "review_language": lc.review_language,
+                        "paper_language": lc.paper_language,
+                        "text_direction": lc.text_direction,
+                        "paper_language_source": lc.paper_language_source,
+                    }
+
                 resp = _post_finalize(
                     callback_url=handoff_bundle["callback_url"],
                     finalize_token=handoff_bundle["finalize_token"],
@@ -774,6 +813,7 @@ def main(argv: list[str] | None = None) -> int:
                     markdown=md_text,
                     paper_markdown=paper_markdown,
                     host_label=host,
+                    language=language_fields,
                 )
                 review_url = resp.get("review_url", "")
                 _print_completion_footer(

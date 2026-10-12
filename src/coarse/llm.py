@@ -24,11 +24,12 @@ from coarse.config import (
     load_config,
     resolve_api_key,
 )
+from coarse.model_registry import register_model_costs
 from coarse.models import (
-    DEFAULT_MODEL,
+    DIRECT_RESPONSES_MODEL_ALIASES,
     JSON_MODE_PREFIXES,
-    KIMI_K2_5_MODEL,
     MARKDOWN_JSON_PREFIXES,
+    OPENROUTER_NAMESPACE_MODELS,
     REASONING_EFFORT_DEFAULT,
     REASONING_MAX_TOKENS_MULTIPLIER,
     is_reasoning_model,
@@ -48,26 +49,8 @@ litellm.suppress_debug_info = True
 # it where it matters (OpenAI o-series, GPT-5 Pro).
 litellm.drop_params = True
 
-# Register models missing from litellm's registry.
-# litellm.model_cost is the lookup used by _clamp_max_tokens.
-# Values from OpenRouter /api/v1/models (verified 2026-03-04).
-_CUSTOM_MODEL_INFO: dict[str, dict] = {
-    DEFAULT_MODEL: {
-        "max_tokens": 1_000_000,
-        "max_output_tokens": 65_536,
-        "input_cost_per_token": 0.26e-6,
-        "output_cost_per_token": 1.56e-6,
-    },
-    KIMI_K2_5_MODEL: {
-        "max_tokens": 131_072,
-        "max_output_tokens": 32_768,
-        "input_cost_per_token": 0.35e-6,
-        "output_cost_per_token": 0.7e-6,
-    },
-}
-for _model_id, _info in _CUSTOM_MODEL_INFO.items():
-    litellm.model_cost[_model_id] = _info
-    litellm.model_cost[f"openrouter/{_model_id}"] = _info
+# Register model metadata before any client clamps tokens or estimates cost.
+register_model_costs()
 
 
 _CTRL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -177,6 +160,19 @@ def _sanitized_completion(*args, **kwargs):
             msg.content = _CTRL_CHAR_RE.sub("", msg.content)
             msg.content = msg.content.replace("\\u0000", "")
     return response
+
+
+def _responses_completion(*, messages: list[dict], **kwargs):
+    """Adapt Instructor's chat-shaped call to LiteLLM's Responses API."""
+    return litellm.responses(input=messages, **kwargs)
+
+
+def _build_responses_create() -> Callable[..., BaseModel]:
+    """Build an Instructor-patched Responses API callable."""
+    return instructor.patch(
+        create=_responses_completion,
+        mode=instructor.Mode.RESPONSES_TOOLS,
+    )
 
 
 def _extract_completion_text(completion: object) -> str | None:
@@ -394,6 +390,16 @@ class LLMClient:
             config = load_config()
         self._model = model or config.default_model
         self._model = _normalize_model(self._model, config)
+        # Some OpenRouter variant IDs don't exist on the provider's own API
+        # (e.g. openai/gpt-5.6-sol-pro → OpenAI 404s). On the direct route,
+        # rewrite to the provider's real model ID and use the Responses API
+        # with the variant's request defaults. The lookup is keyed on bare
+        # IDs, so OpenRouter-proxied models — already `openrouter/`-prefixed by
+        # _normalize_model — never match.
+        self._responses_request_body: dict[str, object] | None = None
+        alias = DIRECT_RESPONSES_MODEL_ALIASES.get(self._model)
+        if alias is not None:
+            self._model, self._responses_request_body = alias[0], dict(alias[1])
         self._mode = _select_instructor_mode(self._model)
         self._client = instructor.from_litellm(_sanitized_completion, mode=self._mode)
         self._structured_fallback_mode = _select_fallback_instructor_mode(self._model, self._mode)
@@ -401,6 +407,9 @@ class LLMClient:
             instructor.from_litellm(_sanitized_completion, mode=self._structured_fallback_mode)
             if self._structured_fallback_mode is not None
             else None
+        )
+        self._responses_create = (
+            _build_responses_create() if self._responses_request_body is not None else None
         )
         self._cost_usd: float = 0.0
         self._lock = threading.Lock()
@@ -416,6 +425,27 @@ class LLMClient:
         # it through call_kwargs removes every call-time read from the
         # dependency chain and closes the race.
         self._api_key: str | None = resolve_api_key(self._model, config)
+
+    def _prepare_responses_kwargs(self, call_kwargs: dict) -> dict:
+        """Merge direct-route defaults into Responses API kwargs."""
+        if self._responses_request_body is None:
+            return call_kwargs
+        prepared = dict(call_kwargs)
+        requested_effort = prepared.pop("reasoning_effort", None)
+        caller_reasoning = dict(prepared.pop("reasoning", None) or {})
+        defaults = dict(self._responses_request_body)
+        default_reasoning = dict(defaults.pop("reasoning", {}) or {})
+        for key, value in defaults.items():
+            prepared.setdefault(key, value)
+        # The selected alias owns its mode ("-pro" must remain pro), while
+        # effort stays independently caller-configurable as OpenAI documents.
+        reasoning = {**caller_reasoning, **default_reasoning}
+        if requested_effort is not None:
+            reasoning["effort"] = requested_effort
+        else:
+            reasoning.setdefault("effort", REASONING_EFFORT_DEFAULT)
+        prepared["reasoning"] = reasoning
+        return prepared
 
     def _complete_with_client(
         self,
@@ -439,6 +469,17 @@ class LLMClient:
         just send ``None``.
         """
         try:
+            if self._responses_create is not None:
+                response = self._responses_create(
+                    model=self._model,
+                    messages=messages,
+                    response_model=response_model,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
+                    max_retries=3,
+                    **call_kwargs,
+                )
+                return response, getattr(response, "_raw_response", None)
             return client.chat.completions.create_with_completion(
                 model=self._model,
                 messages=messages,
@@ -503,7 +544,9 @@ class LLMClient:
         # as "already set"). A caller can still disable by passing a
         # real string like "low" or by passing a non-None sentinel.
         call_kwargs = dict(kwargs)
-        if self._is_reasoning and call_kwargs.get("reasoning_effort") is None:
+        if self._responses_create is not None:
+            call_kwargs = self._prepare_responses_kwargs(call_kwargs)
+        elif self._is_reasoning and call_kwargs.get("reasoning_effort") is None:
             call_kwargs["reasoning_effort"] = REASONING_EFFORT_DEFAULT
         if _is_openrouter_kimi_model(self._model):
             call_kwargs = _prepare_openrouter_kimi_structured_kwargs(call_kwargs)
@@ -547,13 +590,13 @@ class LLMClient:
                 )
         try:
             # Pass model=self._model explicitly so completion_cost uses the
-            # ID we registered in _CUSTOM_MODEL_INFO instead of whatever
+            # ID registered in model_registry instead of whatever
             # concrete version the provider stamped onto the response.
             # OpenRouter maps aliases like ``qwen/qwen3.5-plus-02-15`` to
             # date-stamped versions (e.g. ``qwen/qwen3.5-plus-20260216``)
             # which aren't in litellm's registry, so the default cost
             # lookup raises ``This model isn't mapped yet``.
-            cost = litellm.completion_cost(completion_response=completion, model=self._model)
+            cost = _completion_cost_with_long_context_pricing(completion, self._model)
             if cost is not None:
                 self.add_cost(cost)
         except Exception:
@@ -572,11 +615,13 @@ class LLMClient:
 
         Used for models where instructor's structured output makes no sense
         (e.g. Perplexity Sonar Pro, which returns prose with citations).
-        Cost is tracked like complete(); control characters are still
-        stripped via _sanitized_completion.
+        Cost is tracked like complete(); control characters are stripped on
+        both the Chat Completions and Responses API paths.
         """
         clamped = _clamp_max_tokens(self._model, max_tokens)
         call_kwargs = dict(kwargs)
+        if self._responses_create is not None:
+            call_kwargs = self._prepare_responses_kwargs(call_kwargs)
         # Forward the eagerly-resolved API key on every call (same rationale
         # as complete() — avoids the env-var-at-call-time race that was
         # landing "Missing Authentication header" 401s in prod).
@@ -586,24 +631,37 @@ class LLMClient:
         # ``supports_temperature`` in ``coarse.models``).
         if supports_temperature(self._model):
             call_kwargs.setdefault("temperature", temperature)
-        response = _sanitized_completion(
-            model=self._model,
-            messages=messages,
-            max_tokens=clamped,
-            timeout=timeout,
-            **call_kwargs,
-        )
+        if self._responses_create is not None:
+            response = _responses_completion(
+                model=self._model,
+                messages=messages,
+                max_output_tokens=clamped,
+                timeout=timeout,
+                **call_kwargs,
+            )
+        else:
+            response = _sanitized_completion(
+                model=self._model,
+                messages=messages,
+                max_tokens=clamped,
+                timeout=timeout,
+                **call_kwargs,
+            )
         try:
-            cost = litellm.completion_cost(completion_response=response, model=self._model)
+            cost = _completion_cost_with_long_context_pricing(response, self._model)
             if cost is not None:
                 self.add_cost(cost)
         except Exception:
             logger.debug("Cost tracking failed for model %s", self._model, exc_info=True)
 
-        content = response.choices[0].message.content
+        content = (
+            response.output_text
+            if self._responses_create is not None
+            else response.choices[0].message.content
+        )
         if not content or not content.strip():
             raise ValueError(f"Model {self._model} returned empty response")
-        return content.strip()
+        return _CTRL_CHAR_RE.sub("", content).replace("\\u0000", "").strip()
 
     def add_cost(self, cost_usd: float) -> None:
         """Register an external cost (e.g. from a direct litellm.completion call)."""
@@ -685,6 +743,14 @@ def _normalize_model(model: str, config: CoarseConfig | None = None) -> str:
     key is available, rewrite to 'openrouter/<model>' so the call goes through
     OpenRouter. Config-file keys count — not just env vars.
     """
+    # OpenRouter's own meta-models (e.g. openrouter/fusion) live under the
+    # `openrouter/` vendor namespace, which collides with litellm's
+    # provider-routing prefix: litellm strips the leading `openrouter/` and
+    # would POST a bare `fusion`, which OpenRouter 502s on. Double the slug so
+    # litellm forwards the canonical id intact. Idempotent — the doubled form
+    # already starts with `openrouter/` and falls through the guard below.
+    if model in OPENROUTER_NAMESPACE_MODELS:
+        return "openrouter/" + model
     if model.startswith("openrouter/"):
         return model
     prefix = model.split("/")[0].lower() if "/" in model else ""
@@ -809,19 +875,59 @@ def _clamp_max_tokens(model: str, requested: int) -> int:
     return min(requested, ceiling)
 
 
-def model_cost_per_token(model: str) -> tuple[float, float]:
+def model_cost_per_token(model: str, prompt_tokens: int = 0) -> tuple[float, float]:
     """Return (input_cost_per_token, output_cost_per_token) for a given model.
 
-    Accepts litellm model strings (e.g. 'openai/gpt-4o' or 'gpt-4o').
-    Returns (0.0, 0.0) if model not found.
+    Accepts litellm model strings (e.g. 'openai/gpt-4o' or 'gpt-4o'). When
+    ``prompt_tokens`` crosses a registered long-context threshold, returns that
+    tier's rates. Returns (0.0, 0.0) if model not found.
     """
     costs = _lookup_model_cost(model)
     if costs is None:
         return (0.0, 0.0)
-    return (
-        costs.get("input_cost_per_token", 0.0),
-        costs.get("output_cost_per_token", 0.0),
+    input_cost = costs.get("input_cost_per_token", 0.0)
+    output_cost = costs.get("output_cost_per_token", 0.0)
+    selected_threshold = -1
+    for key, tier_input_cost in costs.items():
+        match = re.fullmatch(r"input_cost_per_token_above_(\d+)k_tokens", key)
+        if match is None:
+            continue
+        threshold = int(match.group(1)) * 1_000
+        if prompt_tokens < threshold or threshold <= selected_threshold:
+            continue
+        tier_output_cost = costs.get(f"output_cost_per_token_above_{match.group(1)}k_tokens")
+        if tier_output_cost is None:
+            continue
+        selected_threshold = threshold
+        input_cost = tier_input_cost
+        output_cost = tier_output_cost
+    return (input_cost, output_cost)
+
+
+def _completion_cost_with_long_context_pricing(response, model: str) -> float | None:
+    """Return LiteLLM's actual cost, corrected for prompt-length price tiers.
+
+    LiteLLM applies several provider-specific long-context fields, but not all
+    OpenRouter thresholds (notably Qwen's 256k tier). Use the response usage to
+    compute a conservative tier-aware floor, while retaining any higher cost
+    LiteLLM reports for cache, routing, or provider-specific charges.
+    """
+    standard_cost = litellm.completion_cost(completion_response=response, model=model)
+    usage = getattr(response, "usage", None)
+    prompt_tokens = max(
+        0,
+        int(getattr(usage, "prompt_tokens", getattr(usage, "input_tokens", 0)) or 0),
     )
+    completion_tokens = max(
+        0,
+        int(getattr(usage, "completion_tokens", getattr(usage, "output_tokens", 0)) or 0),
+    )
+    base_rates = model_cost_per_token(model)
+    tier_rates = model_cost_per_token(model, prompt_tokens=prompt_tokens)
+    if tier_rates == base_rates:
+        return standard_cost
+    tier_cost_floor = prompt_tokens * tier_rates[0] + completion_tokens * tier_rates[1]
+    return max(float(standard_cost or 0.0), tier_cost_floor)
 
 
 # Reasoning-token overhead multiplier for cost estimation.
@@ -866,6 +972,6 @@ def estimate_call_cost(model: str, tokens_in: int, tokens_out: int) -> float:
     pre-flight estimate reflects the real cost. See
     estimate_reasoning_overhead_tokens for the multiplier's calibration.
     """
-    input_cost, output_cost = model_cost_per_token(model)
+    input_cost, output_cost = model_cost_per_token(model, prompt_tokens=tokens_in)
     reasoning_overhead = estimate_reasoning_overhead_tokens(model, tokens_out)
     return input_cost * tokens_in + output_cost * (tokens_out + reasoning_overhead)

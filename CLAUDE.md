@@ -26,7 +26,7 @@ paper (PDF, TXT, MD, TeX, DOCX, HTML, EPUB)
     → [extraction_qa.py] Vision LLM spot-check (auto-triggers on garbled text)
     → [structure.py]     Parse headings + LLM → PaperStructure (sections, math detection, domain)
     → [calibrate_domain] Domain-specific review criteria (parallel with literature)
-    → [literature.py]    Perplexity Sonar Pro search, arXiv fallback (parallel with calibration)
+    → [literature.py]    Perplexity Pro / opt-in Deep Research, arXiv fallback (parallel)
     → [overview.py]      Single overview agent → OverviewFeedback (macro issues)
     → [completeness.py]  Structural-gap pass merged into overview
     → [section agents]   LLM → 15-25 detailed comments (1 per section, parallel)
@@ -60,20 +60,28 @@ src/coarse/
 ├── extraction_openrouter.py # OpenRouter OCR/file-parser transport and response parsing
 ├── extraction_qa.py         # Post-extraction QA via vision LLM (Gemini Flash)
 ├── headless_clients.py      # Claude/Codex/Gemini CLI-backed LLMClient replacements
+├── headless_isolation.py    # Tool-free subprocess env, profiles, and auth isolation
+├── headless_prompt.py       # Fail-closed text-only serializer for headless CLI prompts
 ├── headless_review.py       # Shared entrypoint for headless CLI review runs
+├── handoff_url.py           # Validation and normalization of subscription handoff URLs
 ├── structure.py             # PaperText → PaperStructure (heading parse + math detection + LLM metadata)
 ├── quote_verify.py          # Post-processing quote verification (stricter for math)
 ├── models.py                # Model manifest — single source of truth for all model IDs
+├── model_registry.py        # LiteLLM metadata for new models + long-context price tiers
 ├── garble.py                # OCR garble detection and normalization
+├── textscript.py            # Script-aware token estimation and CJK text heuristics
 ├── llm.py                   # litellm wrapper, model registry, cost tracking
 ├── prompts.py               # All prompt templates
+├── languages.py             # Supported review languages and language resolution
 ├── types.py                 # Pydantic models
 ├── pipeline.py              # review_paper() orchestrator
 ├── progress.py              # Pipeline progress event types for live CLI reporting
 ├── review_stages.py         # Stage-local review helpers used by pipeline.py
 ├── synthesis.py             # Review → markdown string
+├── review_labels.py         # Localized labels used by rendered review markdown
 ├── quality.py               # Quality eval against reference (dev only)
 ├── recall.py                # Recall eval vs. ground-truth expert reviews (dev only)
+├── lang_eval.py             # Cross-language review-consistency evaluation (dev only)
 └── agents/
     ├── __init__.py
     ├── base.py              # ReviewAgent ABC + _build_messages helper + prompt caching
@@ -87,7 +95,7 @@ src/coarse/
     ├── critique.py          # Self-critique quality gate (legacy, superseded by editorial)
     ├── quote_repair.py      # Batched near-miss quote re-anchoring before deterministic re-check
     ├── verify.py            # Adversarial proof verification (math sections)
-    └── literature.py        # Literature search (Perplexity Sonar Pro, arXiv fallback)
+    └── literature.py        # Literature search (Perplexity Pro/Deep, arXiv fallback)
 ```
 
 ### Key Types (types.py)
@@ -104,7 +112,8 @@ src/coarse/
 ### LLM Layer (llm.py)
 
 Uses `litellm` for unified provider interface + `instructor` for structured Pydantic output.
-`LLMClient` wraps both, tracks cost per call.
+`LLMClient` wraps both and tracks cost per call; `model_registry.py` fills LiteLLM catalog
+gaps for newly released models and their long-context pricing tiers.
 Auto-detects API keys from env vars or `~/.coarse/config.toml`.
 
 ### Dependencies
@@ -204,15 +213,17 @@ For any substantial deploy-affecting change, the default path is:
 Concretely:
 
 - Vercel creates preview deployments for non-`main` pushes.
-- `.github/workflows/modal-preview-deploy.yml` deploys both Modal apps
-  from `dev` into the Modal `preview` environment when the change
+- `.github/workflows/modal-preview-deploy.yml` deploys the
+  `coarse-review` Modal app from `dev` into the Modal `preview`
+  environment when the change
   touches deploy-relevant paths; otherwise rerun it manually on `dev`
   if you need a fresh preview Modal deploy.
-- Preview Vercel env vars point at preview Supabase plus preview Modal
-  URLs (`MODAL_FUNCTION_URL` and `MODAL_EXTRACT_URL`), as documented in
+- Preview Vercel env vars point at preview Supabase plus the preview
+  Modal URL (`MODAL_FUNCTION_URL`), as documented in
   `deploy/PREVIEW_ENVIRONMENTS.md`.
-- `.github/workflows/modal-deploy.yml` deploys both Modal apps from
-  `main` to production.
+- `.github/workflows/modal-deploy.yml` deploys `coarse-review` from
+  `main` to production. The legacy `coarse-mcp` app was retired in
+  v1.3.0.
 
 Hard deploy rules:
 
@@ -294,12 +305,12 @@ session operates in its own worktree.
 
 **`src/coarse/models.py` is the single source of truth for ALL model IDs.** Never hardcode model strings in any other file — always `from coarse.models import DEFAULT_MODEL, VISION_MODEL, CHEAP_MODELS`.
 
-Current models (verified 2026-04-10):
-- **Default**: `qwen/qwen3.5-plus-02-15` (via OpenRouter, 1M ctx, $0.26/1.56 per 1M tok)
+Current models (verified 2026-07-29):
+- **Default**: `qwen/qwen3.7-plus` (via OpenRouter, 1M ctx, $0.32/1.28 per 1M tok)
 - **Vision**: `gemini/gemini-3-flash-preview` (1M ctx, $0.50/3.00 per 1M tok) — post-extraction QA (litellm uses `gemini/` prefix)
 - **OCR**: Mistral OCR, always routed through OpenRouter's `file-parser` plugin (never direct). Required: only `OPENROUTER_API_KEY`.
 - **OpenRouter Extraction**: `google/gemini-3-flash-preview` — the host model that carries the file-parser plugin request
-- **Literature Search**: `perplexity/sonar-pro-search` — web-grounded literature search via OpenRouter (~$0.03)
+- **Literature Search**: `perplexity/sonar-pro-search` standard (~$0.03), with opt-in `perplexity/sonar-deep-research` (~$0.25 representative pre-buffer cost)
 - **Quality Eval**: `gemini/gemini-3-flash-preview` — dev-only quality evaluation (single-judge or panel)
 - **Cheap (OpenAI)**: `openai/gpt-5.1-codex-mini` ($0.25/2.00)
 - **Cheap (Anthropic)**: `anthropic/claude-haiku-4.5` ($1.00/5.00)

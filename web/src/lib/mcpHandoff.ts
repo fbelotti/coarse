@@ -23,8 +23,8 @@
 //           (from ~/.coarse/config.toml or .env) for Mistral OCR;
 //           non-PDF sources (.tex, .md, .docx, …) parse locally with
 //           no key at all (#186)
-//        d. Runs the full coarse pipeline, routing every LLM call
-//           through the chosen headless CLI
+//        d. Runs the full coarse pipeline, routing review-reasoning calls
+//           through the chosen headless CLI while vision QA uses OpenRouter
 //        e. POSTs the rendered review back to /api/mcp-finalize with
 //           the finalize_token
 //        f. Prints `https://coarse.ink/review/<paper_id>?token=<t>` —
@@ -37,6 +37,8 @@
 // No server-side extraction. No OpenRouter key on the web backend. The
 // handoff URL is the only thing that crosses the browser→terminal
 // boundary, and it's copy-pasted from a modal.
+
+import { languageName } from "@/lib/languages";
 
 export type ChatHost = "claude-code" | "codex" | "gemini-cli";
 
@@ -63,15 +65,31 @@ export const HOST_CLI_NAME: Record<ChatHost, "claude" | "codex" | "gemini"> = {
 // pre-selected default (see page.tsx setSelectedModel). Latest generation
 // leads; the prior generation stays available as a fallback option.
 export const HOST_DEFAULT_MODELS: Record<ChatHost, string[]> = {
-  "claude-code": ["claude-opus-4-8", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
-  "codex": ["gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini", "gpt-5.4-pro"],
+  "claude-code": ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-haiku-4-5"],
+  "codex": ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4"],
   "gemini-cli": [
-    "gemini-3.5-flash",
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
     "gemini-3.1-pro-preview",
     "gemini-3-flash-preview",
     "gemini-3.1-flash-lite-preview",
   ],
 };
+
+// Carry matching catalog selections into the native CLI, including models
+// released after this suggested list. Never send another provider's model.
+export function getHostModels(host: ChatHost, selectedModel: string): string[] {
+  const prefix = { "claude-code": "anthropic/", codex: "openai/", "gemini-cli": "google/" }[host];
+  if (!selectedModel.startsWith(prefix)) return HOST_DEFAULT_MODELS[host];
+  let nativeModel = selectedModel.slice(prefix.length).replace(/:[^:]+$/, "");
+  // Anthropic CLI version separators differ from the OpenRouter catalog.
+  if (host === "claude-code") nativeModel = nativeModel.replace(/(\d)\.(?=\d)/g, "$1-");
+  if (!nativeModel) return HOST_DEFAULT_MODELS[host];
+  return Array.from(new Set([nativeModel, ...HOST_DEFAULT_MODELS[host]]));
+}
 
 export const EFFORT_LEVELS = ["low", "medium", "high", "max"] as const;
 export type EffortLevel = (typeof EFFORT_LEVELS)[number];
@@ -89,13 +107,13 @@ export type EffortLevel = (typeof EFFORT_LEVELS)[number];
 // The variable is still called `DEFAULT_MCP_UVX_FROM` for backward
 // compatibility with the `test_release_blocker_pin_is_coupled_to_unreleased_version`
 // drift test that enforces the pin matches `__version__`.
-const DEFAULT_MCP_UVX_FROM = "coarse-ink==1.7.0";
+const DEFAULT_MCP_UVX_FROM = "coarse-ink==1.9.6";
 
 export function resolvePinnedUvFrom(): string {
   const raw = (process.env.NEXT_PUBLIC_COARSE_UVX_FROM ?? "").trim();
   if (!raw) return DEFAULT_MCP_UVX_FROM;
   // Allowlist for `NEXT_PUBLIC_COARSE_UVX_FROM` overrides. Accepts:
-  //   1. Plain semver pin: `coarse-ink==1.7.0` (production default).
+  //   1. Plain semver pin: `coarse-ink==1.9.6` (production default).
   //   2. `[mcp]` extra form for operators who want the MCP path.
   //   3. Commit-sha git ref for pinned dev testing.
   //   4. `@dev` or `@main` branch ref — self-updating Preview default,
@@ -158,12 +176,11 @@ export const HOST_LAUNCH_HINT: Record<ChatHost, string> = {
  * Bash call covers the full 10-25min wait instead of 10-25 separate
  * per-poll approval prompts.
  *
- * ``isPdf`` gates STEP 2 (the OpenRouter key check). Only PDF sources
- * run Mistral OCR; non-PDF uploads (.tex, .md, .docx, …) extract
- * locally with no OpenRouter key, so for them STEP 2 explicitly tells
- * the agent NOT to ask for or configure a key (#186). Without this
- * gate, agents stopped a key-free .tex review to demand a key it
- * would never use.
+ * ``isPdf`` and ``deepLiteratureSearch`` gate STEP 2 (the OpenRouter key
+ * check). PDF sources need it for Mistral OCR, while any source with deep
+ * literature search enabled needs it for Perplexity Deep Research. A
+ * standard non-PDF review remains key-free and explicitly tells the agent
+ * not to pause for credentials (#186).
  */
 export function buildAgentPrompt(args: {
   setupCmd: string;
@@ -171,18 +188,40 @@ export function buildAgentPrompt(args: {
   attachCmd: string;
   logFile: string;
   isPdf: boolean;
+  reviewLanguage?: string;
+  deepLiteratureSearch?: boolean;
 }): string {
-  const { setupCmd, runCmd, attachCmd, logFile, isPdf } = args;
+  const {
+    setupCmd,
+    runCmd,
+    attachCmd,
+    logFile,
+    isPdf,
+    reviewLanguage,
+    deepLiteratureSearch = false,
+  } = args;
   const configCmd = setupCmd.replace("coarse install-skills --all --force", "coarse setup");
-  const step2 = isPdf
+  // One-line language directive, only when the user picked a non-auto
+  // language. Empty/undefined → "" so the prompt is byte-identical to
+  // the pre-i18n output.
+  const langName = languageName(reviewLanguage);
+  const languageNote = langName
+    ? `\n\nWrite the review in ${langName} (keep quotes in the paper's original language).`
+    : "";
+  const needsOpenRouterKey = isPdf || deepLiteratureSearch;
+  const openRouterPurpose = isPdf
+    ? deepLiteratureSearch
+      ? "I need an OpenRouter API key for PDF processing (Mistral OCR plus any triggered vision QA) and the requested Perplexity deep literature search."
+      : "I need an OpenRouter API key for PDF processing: Mistral OCR plus any triggered vision QA."
+    : "I need an OpenRouter API key for the requested Perplexity deep literature search (~$0.30 per paper).";
+  const step2 = needsOpenRouterKey
     ? `STEP 2 — Check for an OpenRouter API key without printing its ` +
       `value. Prefer presence-only probes so the key doesn't needlessly ` +
       `show up in the chat transcript:\n\n` +
       `  test -n "$OPENROUTER_API_KEY" && echo "env: set" || echo "env: missing"\n` +
       `  test -f .env && grep -q '^OPENROUTER_API_KEY=' .env && echo ".env: set" || echo ".env: missing"\n\n` +
       `If neither probe reports "set", tell me:\n\n` +
-      `  "I need an OpenRouter API key for the Mistral OCR extraction step ` +
-      `(~$0.10 per paper). A few options:\n` +
+      `  "${openRouterPurpose} A few options:\n` +
       `   1. Paste the key here and I'll save it to ~/.coarse/config.toml ` +
       `via \`${configCmd}\`. Heads up that whatever you paste here passes ` +
       `through the LLM provider (Anthropic / OpenAI / Google), so treat ` +
@@ -220,6 +259,16 @@ export function buildAgentPrompt(args: {
     `use \`uv tool run --python 3.12 --from ...\` ` +
     `wherever the steps below say \`uvx --python 3.12 --from ...\`. Do NOT get stuck on ` +
     `\`uvx: command not found\` or an older system Python.\n\n` +
+    `Use the exact model and effort in the launch command, even if your ` +
+    `current chat uses a different model. For Claude Code, check ` +
+    `\`claude --version\`: Opus 5.5 requires 2.1.280 or later and ` +
+    `Sonnet 5.5 requires 2.1.284 or later; run \`claude update\` if needed. ` +
+    `Codex 0.160.0 was verified with GPT-6 Sol, Luna, and GPT-6.1 Sol. ` +
+    `Check \`codex --version\` and update using its original ` +
+    `installation method if the selected GPT-6 model is unsupported. ` +
+    `Model access depends on the signed-in account. Report any model ` +
+    `access error or fallback shown in the log; do not silently change ` +
+    `the selected model or switch to API billing.\n\n` +
     `STEP 1 — Refresh the coarse-review skill files. ` +
     `Run this command to copy the pinned coarse-review skill bundle into ` +
     `your Claude Code / Codex / Gemini CLI skill folder. This uses uvx, ` +
@@ -229,11 +278,17 @@ export function buildAgentPrompt(args: {
     `version-skew and is safe to ignore — the review runs the same way ` +
     `either way because uvx is already loading the coarse bundle via ` +
     `\`--from\`.\n\n` +
-    `${setupCmd}\n\n` +
+    `\`\`\`sh\n${setupCmd}\n\`\`\`\n\n` +
     `${step2}\n\n` +
-    `STEP 3 — Launch the detached review. Run the EXACT command below, ` +
-    `verbatim. Do not substitute, rewrite, or interpret any argument — ` +
-    `every piece is already filled in. The \`--handoff\` URL is the ` +
+    `STEP 3 — Launch the detached review. Run the command below, ` +
+    `preserving the selected model, effort, flags, and URL destination. ` +
+    `The shell argument after \`--handoff\` must be the bare URL inside ` +
+    `its shell quotes. If chat formatting wraps it as a Markdown link ` +
+    `(\`[label](URL)\`), an autolink (\`<URL>\`), or inline code, remove ` +
+    `only that presentation wrapper; preserve the entire destination, ` +
+    `including query parameters. This formatting correction is authorized ` +
+    `and does not require confirmation. Do not put Markdown link syntax ` +
+    `inside a shell argument. The \`--handoff\` URL is the ` +
     `paper source; coarse-review downloads the paper from that URL ` +
     `over the network at the start of the pipeline. You do NOT need ` +
     `to, and MUST NOT, search the filesystem (no \`find\`, no ` +
@@ -241,36 +296,20 @@ export function buildAgentPrompt(args: {
     `and you do NOT need to ask me for a paper path. This command ` +
     `returns immediately (within 2 seconds) after printing ` +
     `\`Review PID: <N>\` and \`Log file: ${logFile}\`. Run it:\n\n` +
-    `  ${runCmd}\n\n` +
-    `STEP 4 — Wait for the review to finish with a single blocking ` +
-    `bash call. The review takes 10-25 minutes end-to-end. Instead of ` +
-    `polling \`tail\` every 60 seconds (which generates one permission ` +
-    `prompt per poll), use coarse-review's built-in \`--attach\` ` +
-    `watcher, which blocks in a single command until the worker ` +
-    `exits:\n\n` +
-    `  ${attachCmd}\n\n` +
-    `The attach command streams the log to stdout as it's written and ` +
-    `prints a \`[attach] pid=<N> elapsed=<mm:ss> — waiting…\` heartbeat ` +
-    `every 30 seconds of log idleness so the bash tool sees stdout ` +
-    `activity and doesn't think the command is hung. It exits ` +
-    `automatically when the review process exits. IMPORTANT: run it ` +
-    `with a long bash-tool timeout — at least **2700000 ms (45 min)** ` +
-    `in Claude Code's \`Bash\` tool via the \`timeout\` parameter, ` +
-    `\`--timeout 2700\` in Codex, or the equivalent in Gemini CLI. ` +
-    `The 45-minute recommendation leaves ~20 minutes of margin on top ` +
-    `of the 10-25 minute review runtime for cold starts, slow models, ` +
-    `very long papers, and \`--effort max\` runs. 30 minutes used to ` +
-    `be the recommendation and it was tight — every agent's tool ` +
-    `timeout is a wall clock, not an idle-stream cap, so a 25-minute ` +
-    `review with a 30-minute cap leaves only 5 minutes of safety ` +
-    `margin. Bump to 60 minutes if you're reviewing a book-length ` +
-    `paper or you've picked the largest model. Do NOT re-run the ` +
-    `\`--detach\` command from STEP 3 if the attach call returns ` +
-    `early — that would spawn a second worker against the same ` +
-    `handoff URL. If attach exits because the bash tool timed out ` +
-    `(not because the review finished), just re-run the EXACT same ` +
-    `attach command again — it's idempotent and will re-attach to ` +
-    `the same running worker.\n\n` +
+    `\`\`\`sh\n${runCmd}\n\`\`\`\n\n` +
+    `STEP 4 — Attach to the running review. It usually takes 10-25 ` +
+    `minutes, and longer for large papers or maximum effort. Run:\n\n` +
+    `\`\`\`sh\n${attachCmd}\n\`\`\`\n\n` +
+    `The watcher streams logs and idle heartbeats until completion. ` +
+    `Use the terminal tool's supported background or session mechanism ` +
+    `for this long-running command. In Codex, retain the session ID ` +
+    `returned by exec_command and resume with write_stdin; if your ` +
+    `tools use different names, use their documented equivalent. In ` +
+    `Claude Code, use Bash's run_in_background and its task-output ` +
+    `tool. Keep waiting on the same session until it exits. ` +
+    `If the tool ends the watcher early, re-run only this attach ` +
+    `command to reconnect to the same worker. Never repeat STEP 3 ` +
+    `while that worker is running.\n\n` +
     `Attach exit codes tell you what happened:\n` +
     `  - 0 — review completed successfully, \`view:\` + \`local:\` ` +
     `lines are in the log\n` +
@@ -278,7 +317,9 @@ export function buildAgentPrompt(args: {
     `the log\n` +
     `  - 2 — review process died without a completion marker (silent ` +
     `crash); show me the last 50 log lines so I can diagnose\n` +
-    `  - 3 — pidfile missing (launcher never started); re-run STEP 3\n` +
+    `  - 3 — pidfile missing or malformed; the worker may have already ` +
+    `exited and removed it. Read the log and resolve any launch error ` +
+    `before retrying STEP 3. Never repeat an unchanged failing command.\n` +
     `  - 124 — attach's own 30-min timeout tripped (very unusual); ` +
     `re-run the attach command to continue waiting\n\n` +
     `STEP 5 — When attach exits with code 0, read the completion ` +
@@ -308,7 +349,8 @@ export function buildAgentPrompt(args: {
     `where there is no graphical display.\n` +
     `  - The local markdown path (the \`local:\` line)\n` +
     `  - A summary of the recommendation (accept / revise / reject)\n` +
-    `  - The top 3 macro issues from the overview section`
+    `  - The top 3 macro issues from the overview section` +
+    languageNote
   );
 }
 
@@ -330,9 +372,28 @@ export function buildLaunchUrl(args: {
   attachCmd: string;
   logFile: string;
   isPdf: boolean;
+  reviewLanguage?: string;
+  deepLiteratureSearch?: boolean;
 }): string {
-  const { host, runCmd, setupCmd, attachCmd, logFile, isPdf } = args;
-  const prompt = buildAgentPrompt({ setupCmd, runCmd, attachCmd, logFile, isPdf });
+  const {
+    host,
+    runCmd,
+    setupCmd,
+    attachCmd,
+    logFile,
+    isPdf,
+    reviewLanguage,
+    deepLiteratureSearch = false,
+  } = args;
+  const prompt = buildAgentPrompt({
+    setupCmd,
+    runCmd,
+    attachCmd,
+    logFile,
+    isPdf,
+    reviewLanguage,
+    deepLiteratureSearch,
+  });
 
   if (host === "codex") {
     // Codex supports codex://new?prompt=<text> deep links that pre-fill
@@ -414,8 +475,9 @@ export interface HandoffCliCommands {
 export function buildHandoffLandingCommands(args: {
   handoffUrl: string;
   paperId: string;
+  reviewLanguage?: string;
 }): HandoffCliCommands {
-  const { handoffUrl, paperId } = args;
+  const { handoffUrl, paperId, reviewLanguage } = args;
   const quotedUvFrom = shellQuote(MCP_UVX_FROM);
   const logFile = `/tmp/coarse-review-${paperId}.log`;
   // The handoff URL MUST be single-quoted in the shell. After the
@@ -434,7 +496,15 @@ export function buildHandoffLandingCommands(args: {
   const quotedHandoffUrl = shellQuote(handoffUrl);
   const quotedLogFile = shellQuote(logFile);
   const setupCmd = `uvx --python 3.12 --from ${quotedUvFrom} coarse install-skills --all --force`;
-  const runCmd = `uvx --python 3.12 --from ${quotedUvFrom} coarse-review --detach --log-file ${quotedLogFile} --handoff ${quotedHandoffUrl}`;
+  // `--language <name>` is appended only when the user picked a non-auto
+  // language; empty/undefined leaves the command byte-identical to today.
+  // Use the human-readable name (fall back to the raw code if unknown);
+  // it's shell-quoted because names like "Simplified Chinese" contain a
+  // space — the same quoting discipline as the URL and log file above.
+  const langSuffix = reviewLanguage
+    ? ` --language ${shellQuote(languageName(reviewLanguage) ?? reviewLanguage)}`
+    : "";
+  const runCmd = `uvx --python 3.12 --from ${quotedUvFrom} coarse-review --detach --log-file ${quotedLogFile} --handoff ${quotedHandoffUrl}${langSuffix}`;
   // Single blocking watch command that replaces the legacy per-60s
   // tail polling loop. See buildAgentPrompt STEP 4 and the
   // _run_attach docstring in src/coarse/cli_review.py for the full
@@ -458,10 +528,21 @@ export function buildCliCommands(args: {
   model: string;
   effort: EffortLevel;
   paperId: string;
+  reviewLanguage?: string;
+  deepLiteratureSearch?: boolean;
 }): HandoffCliCommands {
-  const { handoffUrl, host, model, effort, paperId } = args;
+  const {
+    handoffUrl,
+    host,
+    model,
+    effort,
+    paperId,
+    reviewLanguage,
+    deepLiteratureSearch = false,
+  } = args;
   const cliName = HOST_CLI_NAME[host];
-  const base = buildHandoffLandingCommands({ handoffUrl, paperId });
-  const runCmd = `${base.runCmd} --host ${cliName} --model ${model} --effort ${effort}`;
+  const base = buildHandoffLandingCommands({ handoffUrl, paperId, reviewLanguage });
+  const deepSuffix = deepLiteratureSearch ? " --deep-literature-search" : "";
+  const runCmd = `${base.runCmd} --host ${cliName} --model ${model} --effort ${effort}${deepSuffix}`;
   return { ...base, runCmd };
 }

@@ -4,21 +4,23 @@ description: >
   Produce a rigorous academic peer review of a research paper, manuscript,
   or preprint (PDF, markdown, TeX, DOCX, HTML, or EPUB) using the full
   coarse pipeline with the user's local Claude Code subscription doing
-  all the LLM reasoning. Every pipeline stage — structure analysis,
+  all the review reasoning. Every review-reasoning stage — structure analysis,
   overview synthesis, per-section review, proof verification, editorial
   pass — is served by a headless `claude -p` subprocess instead of a
-  paid API. Use when the user asks to review, critique, referee, or
+  paid API; PDF vision QA keeps its configured OpenRouter route. Use when the user asks to review, critique, referee, or
   provide feedback on an academic paper. Takes 10-25 minutes. Do NOT
   use for code review, blog posts, or non-academic documents.
 ---
 
 # coarse-review (Claude Code)
 
-Runs the **full coarse review pipeline** on a paper using the local `claude -p` CLI as the LLM backend. Every LLM call the pipeline makes — structure metadata, overview, per-section review, proof verification, editorial dedup — is served by a headless Claude Code subprocess using the user's Claude Max subscription. The only per-paper cost is the ~$0.05-0.15 Mistral OCR extraction for PDF sources, which uses the user's OpenRouter key locally — non-PDF sources (.tex, .md, .txt, .docx, .html, .epub) extract locally with no OpenRouter key at all.
+Runs the **full coarse review pipeline** on a paper using the local `claude -p` CLI as the review-reasoning backend. Structure metadata, overview, per-section review, proof verification, and editorial dedup are served by headless Claude Code subprocesses using the user's Claude Max subscription. PDF sources use the user's OpenRouter key locally for ~$0.05-0.15 Mistral OCR and for a small post-extraction vision-QA charge when that check runs; non-PDF sources (.tex, .md, .txt, .docx, .html, .epub) extract locally with no OpenRouter key at all.
 
 This is the **same pipeline** that powers coarse.ink — only the LLM backend is swapped.
 
 ## Prerequisites
+
+Check `claude --version`: Opus 5.5 requires Claude Code 2.1.280 or later, and Sonnet 5.5 requires 2.1.284 or later. Run `claude update` if needed. Preserve the handoff command's exact `--model` and `--effort`, and report any model-access error or fallback shown in the log. Do not change the model or switch to API billing silently.
 
 - `uvx` preferred, `uv` acceptable. First run:
   `command -v uvx || command -v uv`
@@ -31,27 +33,27 @@ This is the **same pipeline** that powers coarse.ink — only the LLM backend is
   - If `uv` exists but `uvx` does not, replace `uvx --python 3.12 --from ...` below with
     `uv tool run --python 3.12 --from ...`.
 - Refresh the bundled `coarse-review` skill with an ephemeral install:
-  `uvx --python 3.12 --from 'coarse-ink==1.7.0' coarse install-skills --all --force`
+  `uvx --python 3.12 --from 'coarse-ink==1.9.6' coarse install-skills --all --force`
   (If that fails with `No such command 'install-skills'`, you're on a
   PyPI release that predates the command — upgrade or ignore; the skill
   bundle is also loadable directly via `uvx --from` without install.)
-- **OpenRouter API key required for PDF papers only** — Mistral OCR extraction (~$0.10 per paper) runs on PDFs alone. Non-PDF sources (.tex, .md, .txt, .docx, .html, .epub) extract locally and need no OpenRouter key at all: skip the probes below and never block a non-PDF review on a missing key. Prefer checking for the key with presence-only probes so you don't needlessly echo its value into the transcript, but if the user hands you the key directly just save it — don't lecture them.
+- **OpenRouter API key required for PDF papers or an explicitly requested deep literature search** — PDFs use Mistral OCR (~$0.10 per paper) plus a small vision-QA charge when that check runs. Standard non-PDF reviews extract locally and need no OpenRouter key; `--deep-literature-search` uses Perplexity Sonar Deep Research for any format and normally adds about $0.30. Skip the probes below only when both conditions are absent. Prefer checking for the key with presence-only probes so you don't needlessly echo its value into the transcript, but if the user hands you the key directly just save it — don't lecture them.
 
-  For PDF papers, before running the review, check whether `OPENROUTER_API_KEY` is already configured:
+  For PDF papers, or whenever deep literature search is requested, check whether `OPENROUTER_API_KEY` is already configured before running:
   - In the environment: `test -n "$OPENROUTER_API_KEY" && echo "env: set" || echo "env: missing"`
   - In a `.env` file in the current directory: `test -f .env && grep -q '^OPENROUTER_API_KEY=' .env && echo ".env: set" || echo ".env: missing"`
 
-  If the paper is a PDF and neither probe reports "set", ask the user:
+  If the paper is a PDF or deep literature was requested and neither probe reports "set", ask the user:
 
-  > I need an OpenRouter API key for the OCR extraction step (~$0.10 per paper). A few options:
+  > I need an OpenRouter API key for PDF OCR (~$0.10) and/or the requested deep literature search (~$0.30). A few options:
   >
-  > 1. Paste the key here and I'll save it to `~/.coarse/config.toml` via `uvx --python 3.12 --from 'coarse-ink==1.7.0' coarse setup`. Note the key passes through the LLM provider (Anthropic / OpenAI / Google) on its way to me, so treat it as slightly less private than one you typed into a local terminal — rotate at https://openrouter.ai/settings/keys if that worries you.
+  > 1. Paste the key here and I'll save it to `~/.coarse/config.toml` via `uvx --python 3.12 --from 'coarse-ink==1.9.6' coarse setup`. Note the key passes through the LLM provider (Anthropic / OpenAI / Google) on its way to me, so treat it as slightly less private than one you typed into a local terminal — rotate at https://openrouter.ai/settings/keys if that worries you.
   > 2. Set it yourself in a separate terminal: `export OPENROUTER_API_KEY=sk-or-v1-...` or add it to `.env` in your current directory, then re-ask me.
-  > 3. Run `uvx --python 3.12 --from 'coarse-ink==1.7.0' coarse setup` in a separate terminal yourself and paste the key into its interactive prompt — the key never touches this chat.
+  > 3. Run `uvx --python 3.12 --from 'coarse-ink==1.9.6' coarse setup` in a separate terminal yourself and paste the key into its interactive prompt — the key never touches this chat.
   >
   > Which do you want?
 
-  If the user pastes a key here, save it via `uvx --python 3.12 --from 'coarse-ink==1.7.0' coarse setup` with the pasted value and confirm it's stored. Their chat, their choice.
+  If the user pastes a key here, save it via `uvx --python 3.12 --from 'coarse-ink==1.9.6' coarse setup` with the pasted value and confirm it's stored. Their chat, their choice.
 - `claude` CLI logged in.
 
 ## How to run
@@ -69,16 +71,16 @@ Use a **per-review unique log file** so parallel runs in the same shell don't cl
 LOG=/tmp/coarse-review-$(basename <paper_path> .pdf).log
 
 # STEP 2a — launch (returns within 2 seconds with Review PID + Log file)
-uvx --python 3.12 --from 'coarse-ink==1.7.0' \
+uvx --python 3.12 --from 'coarse-ink==1.9.6' \
   coarse-review --detach --log-file "$LOG" \
-  <paper_path> --host claude [--model claude-opus-4-6] [--effort high]
+  <paper_path> --host claude [--model claude-opus-5] [--effort high] [--deep-literature-search]
 
 # STEP 2b — wait (one blocking call, ~10-25 min, emits heartbeats)
-uvx --python 3.12 --from 'coarse-ink==1.7.0' \
+uvx --python 3.12 --from 'coarse-ink==1.9.6' \
   coarse-review --attach "$LOG"
 ```
 
-Run the attach call with a long Bash-tool timeout: in Claude Code, pass `timeout: 2700000` (45 minutes) on the `Bash` tool invocation so the tool doesn't kill the blocking command. The 45-minute recommendation leaves ~20 minutes of margin on top of the 10-25 minute review runtime for cold starts, slow models, long papers, and `--effort max` runs — 30 minutes is too tight because the tool timeout is a wall clock, not an idle-stream cap. Bump to 60 minutes for book-length papers or the largest models. Do NOT re-run the `--detach` command from STEP 2a if the attach call returns early — that would spawn a second worker. Safe to Ctrl+C the attach: the watcher detaches but the worker keeps running, and you can re-attach with the same command. Attach exit codes: `0` complete, `1` failure marker, `2` silent crash, `3` missing pidfile, `124` attach's own 30-min timeout, `130` user interrupt.
+Run the attach command with Bash's `run_in_background` option, then use the task-output tool to wait for that same task until it exits. Use the documented tool timeout limits; do not assume a 45-minute Bash timeout is accepted. If the tool ends the watcher early, re-run the same attach command to reconnect. Never repeat `--detach` while that worker is running. Attach exit codes: `0` complete, `1` failure marker, `2` silent crash, `3` missing pidfile, `124` attach's own 30-minute timeout, `130` user interrupt.
 
 **When attach exits with code 0, do NOT hunt across the filesystem for the review file.** `coarse-review` prints the authoritative paths in the final log lines:
 
@@ -91,7 +93,7 @@ rg '^  view:|^  local:' "$LOG"
 
 If `view:` says `unavailable`, treat that as a callback failure and report only the local path. Do **not** try to discover another web URL, and do **not** run broad `find`, `locate`, `lsof`, or whole-computer searches trying to rediscover the output.
 
-Available models: `claude-opus-4-6` (default), `claude-sonnet-4-6`, `claude-haiku-4-5`.
+Available models: `claude-opus-5-5` (default), `claude-sonnet-5-5`, `claude-fable-5-1`, `claude-opus-5`, `claude-sonnet-5`, `claude-opus-4-8`, `claude-haiku-4-5`.
 Available effort levels: `low`, `medium`, `high` (default), `max`.
 
 If the user came from the coarse web form, they'll paste a handoff URL instead of a local file path. The paper is a REMOTE resource at that URL — do NOT search for a local PDF and do NOT ask the user for a file path. Same two-step launch+attach pattern:
@@ -100,12 +102,12 @@ If the user came from the coarse web form, they'll paste a handoff URL instead o
 LOG=/tmp/coarse-review-$(date +%s).log
 
 # STEP 2a — launch
-uvx --python 3.12 --from 'coarse-ink==1.7.0' \
+uvx --python 3.12 --from 'coarse-ink==1.9.6' \
   coarse-review --detach --log-file "$LOG" \
   --handoff https://coarse.ink/h/<token> --host claude [--model ...] [--effort ...]
 
-# STEP 2b — wait (same long-timeout discipline as local mode)
-uvx --python 3.12 --from 'coarse-ink==1.7.0' \
+# STEP 2b — wait (use the same background-task mechanism as local mode)
+uvx --python 3.12 --from 'coarse-ink==1.9.6' \
   coarse-review --attach "$LOG"
 ```
 

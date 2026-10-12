@@ -32,9 +32,6 @@ on:
 permissions:
   contents: read
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 concurrency:
   group: supabase-migrate-preview
   cancel-in-progress: false
@@ -47,7 +44,7 @@ jobs:
     environment: preview-modal
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install psql
         run: |

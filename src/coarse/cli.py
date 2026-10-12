@@ -212,6 +212,14 @@ def review(
     model: Optional[str] = typer.Option(
         None, "--model", "-m", help="LiteLLM model string (e.g. openai/gpt-4o)"
     ),
+    language: Optional[str] = typer.Option(
+        None,
+        "--language",
+        "-l",
+        help="Language for the review output, e.g. 'Spanish', 'French', "
+        "'Simplified Chinese' (default: English). Quotes stay in the paper's "
+        "original language. Falls back to review_language in ~/.coarse/config.toml.",
+    ),
     api_key: Optional[str] = typer.Option(
         None,
         "--api-key",
@@ -224,6 +232,11 @@ def review(
     cheap: bool = typer.Option(False, "--cheap", help="Use cheapest available model"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip cost confirmation prompt"),
     no_qa: bool = typer.Option(False, "--no-qa", help="Skip post-extraction quality check"),
+    deep_literature_search: bool = typer.Option(
+        False,
+        "--deep-literature-search",
+        help="Use Perplexity Sonar Deep Research for a more exhaustive literature pass",
+    ),
     eval_ref: Optional[Path] = typer.Option(
         None, "--eval", help="Path to reference review markdown for quality scoring"
     ),
@@ -252,6 +265,12 @@ def review(
         raise typer.Exit(code=1)
 
     config = load_config()
+    if deep_literature_search and not has_provider_key("openrouter", config):
+        console.print(
+            "[red]--deep-literature-search requires an OpenRouter API key. "
+            "Set OPENROUTER_API_KEY, pass --api-key, or add it with coarse setup.[/red]"
+        )
+        raise typer.Exit(code=1)
     if no_qa:
         config = config.model_copy(update={"extraction_qa": False})
     # Resolve model: --cheap > --model > config default
@@ -306,13 +325,19 @@ def review(
     )
     with progress_context as progress_display:
         progress_callback = None if progress_display is None else progress_display.callback
-        review_obj, markdown, paper_text = review_paper(
-            pdf_path=pdf,
-            model=resolved_model,
-            skip_cost_gate=yes,
-            config=config,
-            progress_callback=progress_callback,
-        )
+        review_kwargs = {
+            "pdf_path": pdf,
+            "model": resolved_model,
+            "skip_cost_gate": yes,
+            "config": config,
+            "language": language,
+            "progress_callback": progress_callback,
+        }
+        if deep_literature_search:
+            # Preserve the exact legacy call shape while the option is off;
+            # third-party wrappers may still mirror the older signature.
+            review_kwargs["deep_literature_search"] = True
+        review_obj, markdown, paper_text = review_paper(**review_kwargs)
 
     out_path.write_text(markdown, encoding="utf-8")
     n_comments = len(review_obj.detailed_comments)

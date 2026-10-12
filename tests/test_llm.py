@@ -1,5 +1,10 @@
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import instructor
 import pytest
 from instructor.core.exceptions import FailedAttempt, InstructorRetryException
 from pydantic import BaseModel, ValidationError
@@ -7,8 +12,10 @@ from pydantic import BaseModel, ValidationError
 from coarse.config import CoarseConfig
 from coarse.llm import (
     LLMClient,
+    _completion_cost_with_long_context_pricing,
     _inject_openrouter_privacy,
     _is_openrouter_kimi_model,
+    _normalize_model,
     _prepare_openrouter_kimi_structured_kwargs,
     _sanitized_completion,
     _select_fallback_instructor_mode,
@@ -17,7 +24,21 @@ from coarse.llm import (
     estimate_reasoning_overhead_tokens,
     model_cost_per_token,
 )
-from coarse.models import REASONING_EFFORT_DEFAULT, REASONING_MAX_TOKENS_MULTIPLIER
+from coarse.models import (
+    CLAUDE_FABLE_5_MODEL,
+    CLAUDE_OPUS_5_MODEL,
+    FUSION_MODEL,
+    GPT_5_6_LUNA_MODEL,
+    GPT_5_6_SOL_MODEL,
+    GPT_5_6_SOL_PRO_MODEL,
+    GPT_5_6_TERRA_MODEL,
+    GROK_4_5_MODEL,
+    KIMI_K3_MODEL,
+    LONG_CONTEXT_PRICING_TIERS,
+    QWEN_3_7_PLUS_MODEL,
+    REASONING_EFFORT_DEFAULT,
+    REASONING_MAX_TOKENS_MULTIPLIER,
+)
 from coarse.types import OverviewFeedback
 
 TEST_MODEL = "test/mock-model"
@@ -95,6 +116,74 @@ def test_model_cost_per_token_known_model():
     assert out_cost > 0
 
 
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        CLAUDE_FABLE_5_MODEL,
+        CLAUDE_OPUS_5_MODEL,
+        GPT_5_6_LUNA_MODEL,
+        GPT_5_6_TERRA_MODEL,
+        GROK_4_5_MODEL,
+        KIMI_K3_MODEL,
+        QWEN_3_7_PLUS_MODEL,
+    ],
+)
+def test_current_featured_models_have_registered_pricing(model_id):
+    in_cost, out_cost = model_cost_per_token(model_id)
+    assert in_cost > 0
+    assert out_cost > 0
+
+
+@pytest.mark.parametrize("model_id,tier", LONG_CONTEXT_PRICING_TIERS.items())
+def test_featured_long_context_pricing_uses_threshold_tier(model_id, tier):
+    threshold = int(tier["min_prompt_tokens"])
+    base = model_cost_per_token(model_id, prompt_tokens=threshold - 1)
+    long_context = model_cost_per_token(model_id, prompt_tokens=threshold)
+
+    assert long_context == (
+        tier["input_cost_per_token"],
+        tier["output_cost_per_token"],
+    )
+    assert long_context != base
+
+
+def test_litellm_actual_cost_registry_has_qwen_long_context_tier():
+    """Actual usage tracking must use the same threshold as the cost gate."""
+    from litellm import ModelResponse, Usage
+
+    tier = LONG_CONTEXT_PRICING_TIERS[QWEN_3_7_PLUS_MODEL]
+    threshold = int(tier["min_prompt_tokens"])
+    response = ModelResponse(
+        model=QWEN_3_7_PLUS_MODEL,
+        usage=Usage(prompt_tokens=threshold, completion_tokens=100),
+    )
+
+    actual = _completion_cost_with_long_context_pricing(
+        response,
+        f"openrouter/{QWEN_3_7_PLUS_MODEL}",
+    )
+    expected = threshold * float(tier["input_cost_per_token"]) + 100 * float(
+        tier["output_cost_per_token"]
+    )
+    assert actual == pytest.approx(expected)
+
+
+def test_responses_usage_fields_preserve_long_context_cost_floor():
+    tier = LONG_CONTEXT_PRICING_TIERS[GPT_5_6_SOL_MODEL]
+    threshold = int(tier["min_prompt_tokens"])
+    response = SimpleNamespace(
+        usage=SimpleNamespace(input_tokens=threshold, output_tokens=100),
+    )
+
+    with patch("coarse.llm.litellm.completion_cost", return_value=0.0):
+        actual = _completion_cost_with_long_context_pricing(response, GPT_5_6_SOL_MODEL)
+
+    expected = threshold * float(tier["input_cost_per_token"]) + 100 * float(
+        tier["output_cost_per_token"]
+    )
+    assert actual == pytest.approx(expected)
+
+
 def test_model_cost_per_token_unknown_model():
     result = model_cost_per_token("bogus/nonexistent-model-xyz-999")
     assert result == (0.0, 0.0)
@@ -112,6 +201,54 @@ def test_estimate_call_cost():
     result = estimate_call_cost("gpt-4o", 1000, 500)
     assert result > 0
     assert abs(result - expected) < 1e-12
+
+
+def test_normalize_model_doubles_openrouter_fusion():
+    # OpenRouter's own meta-models live under the `openrouter/` vendor namespace,
+    # which collides with litellm's provider-routing prefix. The canonical slug
+    # must be doubled or litellm POSTs a bare `fusion` and OpenRouter 502s.
+    assert _normalize_model(FUSION_MODEL) == "openrouter/openrouter/fusion"
+
+
+def test_normalize_model_fusion_doubling_is_idempotent():
+    # The doubled form already starts with `openrouter/`, so re-normalizing it
+    # must not triple-prefix.
+    doubled = _normalize_model(FUSION_MODEL)
+    assert _normalize_model(doubled) == doubled
+
+
+def test_fusion_cost_per_token_resolves_for_both_routing_forms():
+    # Canonical id (used by the cost gate) and the doubled routing form (which
+    # `self._model` becomes after _normalize_model) must both price > 0, since
+    # OpenRouter reports dynamic (-1) pricing that would otherwise zero out.
+    for model in (FUSION_MODEL, "openrouter/openrouter/fusion"):
+        in_cost, out_cost = model_cost_per_token(model)
+        assert in_cost > 0, model
+        assert out_cost > 0, model
+
+
+def test_estimate_call_cost_positive_for_fusion():
+    assert estimate_call_cost(FUSION_MODEL, 5000, 2000) > 0
+
+
+def test_select_instructor_mode_fusion_uses_json():
+    # Fusion routes through OpenRouter, so it gets JSON mode (verified to work
+    # against the live endpoint).
+    assert _select_instructor_mode("openrouter/openrouter/fusion") == instructor.Mode.JSON
+
+
+def test_fusion_doubled_routing_form_registered_in_litellm_cost():
+    # Runtime cost tracking calls litellm.completion_cost(model=self._model),
+    # where self._model is the doubled `openrouter/openrouter/fusion`. That only
+    # resolves because _CUSTOM_MODEL_INFO's registration loop also registers the
+    # `openrouter/`-prefixed form. Guard it so a refactor of that loop can't
+    # silently send Fusion cost tracking back to $0 (it's swallowed at runtime).
+    import litellm
+
+    info = litellm.model_cost.get("openrouter/openrouter/fusion")
+    assert info is not None
+    assert info["input_cost_per_token"] > 0
+    assert info["output_cost_per_token"] > 0
 
 
 def test_client_uses_config_model(mock_instructor_client, monkeypatch):
@@ -275,6 +412,20 @@ def test_is_reasoning_property_false_for_gpt5_chat(mock_instructor_client):
     # gpt-5*-chat are the only non-reasoning gpt-5 variants (issue #185).
     client = _reasoning_client("openai/gpt-5-chat", mock_instructor_client)
     assert client.is_reasoning is False
+
+
+def test_glm_flash_reserves_reasoning_headroom(mock_instructor_client):
+    client = _reasoning_client("z-ai/glm-5.3-flash", mock_instructor_client)
+    assert client.is_reasoning
+    with patch("coarse.llm.litellm.completion_cost", return_value=0.0):
+        client.complete(
+            messages=[{"role": "user", "content": "x"}],
+            response_model=_SimpleModel,
+            max_tokens=4096,
+        )
+    call = mock_instructor_client.chat.completions.create_with_completion.call_args
+    assert call.kwargs["max_tokens"] >= 32768
+    assert call.kwargs["reasoning_effort"] == "medium"
 
 
 def test_complete_bumps_max_tokens_for_reasoning_model(mock_instructor_client):
@@ -1332,3 +1483,205 @@ def test_sanitized_completion_falls_back_to_positional_model():
 
     # api_key must be injected even though model arrived as args[0].
     assert captured["kwargs"].get("api_key") == "sk-or-v1-fallback-positional"
+
+
+# ---------------------------------------------------------------------------
+# Direct Responses API aliases (OpenRouter variant IDs on direct routes)
+# ---------------------------------------------------------------------------
+
+
+def test_sol_pro_direct_route_aliases_model_and_injects_reasoning_body(
+    mock_instructor_client, monkeypatch
+):
+    """openai/gpt-5.6-sol-pro is an OpenRouter-only ID. With a direct OpenAI
+    key, the Responses request must use the real OpenAI model plus pro mode
+    and the independently configured default reasoning effort."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    client = _reasoning_client(GPT_5_6_SOL_PRO_MODEL, mock_instructor_client)
+    client._responses_create.return_value = _SimpleModel(value="ok")
+    assert client.model == GPT_5_6_SOL_MODEL
+
+    with patch("coarse.llm.litellm.completion_cost", return_value=0.0):
+        client.complete(
+            messages=[{"role": "user", "content": "x"}],
+            response_model=_SimpleModel,
+        )
+
+    call = client._responses_create.call_args
+    assert call.kwargs["model"] == GPT_5_6_SOL_MODEL
+    assert call.kwargs["reasoning"] == {
+        "mode": "pro",
+        "effort": REASONING_EFFORT_DEFAULT,
+    }
+    assert call.kwargs["store"] is False
+    assert "reasoning_effort" not in call.kwargs
+    mock_instructor_client.chat.completions.create_with_completion.assert_not_called()
+
+
+def test_sol_pro_direct_route_keeps_explicit_caller_reasoning_effort(
+    mock_instructor_client, monkeypatch
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    client = _reasoning_client(GPT_5_6_SOL_PRO_MODEL, mock_instructor_client)
+    client._responses_create.return_value = _SimpleModel(value="ok")
+
+    with patch("coarse.llm.litellm.completion_cost", return_value=0.0):
+        client.complete(
+            messages=[{"role": "user", "content": "x"}],
+            response_model=_SimpleModel,
+            reasoning_effort="high",
+        )
+
+    call = client._responses_create.call_args
+    assert call.kwargs["reasoning"] == {"mode": "pro", "effort": "high"}
+    assert "reasoning_effort" not in call.kwargs
+
+
+def test_sol_pro_direct_route_owns_mode_and_preserves_caller_body(
+    mock_instructor_client, monkeypatch
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    client = _reasoning_client(GPT_5_6_SOL_PRO_MODEL, mock_instructor_client)
+    client._responses_create.return_value = _SimpleModel(value="ok")
+
+    with patch("coarse.llm.litellm.completion_cost", return_value=0.0):
+        client.complete(
+            messages=[{"role": "user", "content": "x"}],
+            response_model=_SimpleModel,
+            reasoning={"mode": "standard", "effort": "xhigh"},
+            extra_body={"other": 1},
+        )
+
+    call = client._responses_create.call_args
+    assert call.kwargs["reasoning"] == {"mode": "pro", "effort": "xhigh"}
+    assert call.kwargs["extra_body"] == {"other": 1}
+
+
+def test_sol_pro_complete_text_forwards_reasoning_body(mock_instructor_client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    captured: dict = {}
+
+    def fake_completion(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            output_text="hello",
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+
+    client = LLMClient(model=GPT_5_6_SOL_PRO_MODEL, config=CoarseConfig())
+    with (
+        patch("coarse.llm._responses_completion", side_effect=fake_completion),
+        patch("coarse.llm.litellm.completion_cost", return_value=0.0),
+    ):
+        out = client.complete_text(messages=[{"role": "user", "content": "x"}])
+
+    assert out == "hello"
+    assert captured["model"] == GPT_5_6_SOL_MODEL
+    assert captured["reasoning"] == {
+        "mode": "pro",
+        "effort": REASONING_EFFORT_DEFAULT,
+    }
+    assert captured["store"] is False
+    assert captured["max_output_tokens"] == 4096
+
+
+def test_sol_pro_direct_route_posts_responses_endpoint(monkeypatch):
+    """Exercise the pinned LiteLLM + Instructor stack through HTTP.
+
+    Mock-only kwargs tests cannot detect a regression back to /chat/completions.
+    """
+    captured: dict = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            captured["path"] = self.path
+            captured["body"] = json.loads(body)
+            tool_name = captured["body"]["tools"][0]["name"]
+            payload = {
+                "id": "resp_test",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "gpt-5.6-sol",
+                "output": [
+                    {
+                        "id": "fc_test",
+                        "call_id": "call_test",
+                        "type": "function_call",
+                        "name": tool_name,
+                        "arguments": '{"value":"ok"}',
+                        "status": "completed",
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 1,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens": 1,
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                    "total_tokens": 2,
+                },
+            }
+            data = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    try:
+        client = LLMClient(model=GPT_5_6_SOL_PRO_MODEL, config=CoarseConfig())
+        with patch("coarse.llm.litellm.completion_cost", return_value=0.0):
+            result = client.complete(
+                messages=[{"role": "user", "content": "x"}],
+                response_model=_SimpleModel,
+                reasoning_effort="high",
+                api_base=f"http://127.0.0.1:{server.server_port}/v1",
+            )
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+    assert result.value == "ok"
+    assert captured["path"] == "/v1/responses"
+    assert captured["body"]["model"] == "gpt-5.6-sol"
+    assert captured["body"]["reasoning"] == {"mode": "pro", "effort": "high"}
+    assert captured["body"]["store"] is False
+    assert "reasoning_effort" not in captured["body"]
+
+
+def test_sol_pro_openrouter_route_keeps_variant_id_untouched(mock_instructor_client, monkeypatch):
+    """With only an OpenRouter key, the variant ID is valid as-is on the
+    proxied route — no alias rewrite, no reasoning extra_body, and the
+    default reasoning_effort still applies."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    client = _reasoning_client(GPT_5_6_SOL_PRO_MODEL, mock_instructor_client)
+    assert client.model == f"openrouter/{GPT_5_6_SOL_PRO_MODEL}"
+
+    with patch("coarse.llm.litellm.completion_cost", return_value=0.0):
+        client.complete(
+            messages=[{"role": "user", "content": "x"}],
+            response_model=_SimpleModel,
+        )
+
+    call = mock_instructor_client.chat.completions.create_with_completion.call_args
+    assert call.kwargs["model"] == f"openrouter/{GPT_5_6_SOL_PRO_MODEL}"
+    assert "extra_body" not in call.kwargs
+    assert call.kwargs.get("reasoning_effort") == REASONING_EFFORT_DEFAULT
+
+
+def test_sol_pro_variant_has_registered_pricing():
+    # The pre-flight cost gate prices the PRE-alias ID the user typed; an
+    # unregistered ID silently quotes $0 and skips the confirmation prompt.
+    in_cost, out_cost = model_cost_per_token(GPT_5_6_SOL_PRO_MODEL)
+    assert in_cost > 0
+    assert out_cost > 0

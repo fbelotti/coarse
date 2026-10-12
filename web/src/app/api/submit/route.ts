@@ -9,6 +9,7 @@ import { buildReviewKey, buildReviewUrl } from "@/lib/reviewAccess";
 import { isEmailCapacityReached } from "@/lib/emailCapacity";
 import { consumeReviewHandoffSecret } from "@/lib/routeHandoffAuth";
 import { sendReviewEmail } from "@/lib/email";
+import { confirmationEmailCopy } from "@/lib/confirmationEmail";
 import {
   buildModalWebhookHostSuffix,
   getModalWebhookConfig,
@@ -19,6 +20,12 @@ import {
 } from "@/lib/reviewCapacity";
 import { getSubmissionPauseResponse } from "@/lib/systemStatus";
 import { getSiteOriginForRequest } from "@/lib/siteOrigin";
+import {
+  parseLanguageFields,
+  validateLanguageFields,
+  languageUpdateFields,
+  type LanguageFields,
+} from "@/lib/language";
 
 export const maxDuration = 30;
 // Budget below the 30s Vercel function ceiling. A slow Modal cold start of
@@ -78,6 +85,8 @@ export async function POST(request: NextRequest) {
   let storagePath = "";
   let authorNotes = "";
   let handoffSecret = "";
+  let deepLiteratureSearch = false;
+  let lang: LanguageFields = parseLanguageFields({});
 
   try {
     const body = await request.json();
@@ -88,6 +97,17 @@ export async function POST(request: NextRequest) {
     storagePath = (body.storage_path ?? "").trim();
     authorNotes = (body.author_notes ?? "").trim();
     handoffSecret = (body.handoff_secret ?? "").trim();
+    if (
+      body.deep_literature_search !== undefined &&
+      typeof body.deep_literature_search !== "boolean"
+    ) {
+      return NextResponse.json(
+        { error: "deep_literature_search must be a boolean" },
+        { status: 400 },
+      );
+    }
+    deepLiteratureSearch = body.deep_literature_search === true;
+    lang = parseLanguageFields(body);
   } catch {
     return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
   }
@@ -107,11 +127,14 @@ export async function POST(request: NextRequest) {
   const emailSkipped =
     email.length === 0 && (await isEmailCapacityReached(supabaseAdmin));
   if (!emailSkipped) {
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return NextResponse.json({ error: "Invalid email address" }, { status: 400 });
-    }
     if (email.length > 254) {
       return NextResponse.json({ error: "Email too long" }, { status: 400 });
+    }
+    // Keep the hard length bound before the backtracking email regex. Without
+    // that ordering, a capability-bearing request with many dot candidates
+    // can consume seconds of CPU before reaching the length check.
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return NextResponse.json({ error: "Invalid email address" }, { status: 400 });
     }
   }
   if (!apiKey) {
@@ -128,6 +151,10 @@ export async function POST(request: NextRequest) {
   // provide meaningful room for prompt-injection payloads.
   if (authorNotes.length > 2000) {
     return NextResponse.json({ error: "Author notes too long (max 2000 chars)" }, { status: 400 });
+  }
+  const languageError = validateLanguageFields(lang);
+  if (languageError) {
+    return NextResponse.json({ error: languageError }, { status: 400 });
   }
   if (!storagePath) {
     return NextResponse.json({ error: "No storage path provided" }, { status: 400 });
@@ -235,9 +262,14 @@ export async function POST(request: NextRequest) {
   const statusUrl = buildReviewUrl(siteUrl, "status", id, accessToken);
   const reviewKey = buildReviewKey(id, accessToken);
 
-  // Update model on the review record
-  if (model) {
-    await supabaseAdmin.from("reviews").update({ model }).eq("id", id);
+  // Persist the model + any language-contract fields the form sent. The worker
+  // resolves the *effective* review_language after detection (an empty
+  // review_language means "follow the detected paper language"), so we only
+  // record the raw user-supplied values here.
+  const reviewMetadataUpdate: Record<string, string> = languageUpdateFields(lang);
+  if (model) reviewMetadataUpdate.model = model;
+  if (Object.keys(reviewMetadataUpdate).length > 0) {
+    await supabaseAdmin.from("reviews").update(reviewMetadataUpdate).eq("id", id);
   }
 
   // Mark the reviews row as failed instead of deleting it on mid-submit
@@ -323,6 +355,12 @@ export async function POST(request: NextRequest) {
         email,
         model: model || undefined,
         author_notes: authorNotes || undefined,
+        deep_literature_search: deepLiteratureSearch,
+        // Forwarded so the worker can resolve the effective review language
+        // after it detects paper_language (consumed in PR-B). Empty until the
+        // submit form ships a language picker.
+        review_language: lang.review_language || undefined,
+        site_language: lang.site_language || undefined,
       }),
     });
 
@@ -391,15 +429,24 @@ export async function POST(request: NextRequest) {
   // fixed in the wrapper, not papered over at the call site.
   const paperFilename = reviewRow.paper_filename ?? "your paper";
   if (email) {
+    // Localize to the chosen site language (the only language known at submit
+    // time; review_language may still be "follow the paper"). English fallback.
+    const copy = confirmationEmailCopy(lang.site_language);
+    const safeTitle = escapeHtml(paperFilename);
+    const bodyLine = model
+      ? copy.body
+          .replace("{title}", () => safeTitle)
+          .replace("{model}", () => escapeHtml(model))
+      : copy.bodyNoModel.replace("{title}", () => safeTitle);
     await sendReviewEmail({
       to: email,
-      subject: `Your paper "${paperFilename}" is being reviewed`,
+      subject: copy.subject.replace("{title}", () => paperFilename),
       reviewId: id,
       html: [
-        `<p>Hi,</p>`,
-        `<p>Your paper <strong>${escapeHtml(paperFilename)}</strong> is being reviewed${model ? ` using <strong>${escapeHtml(model)}</strong>` : ""}. We'll email you when it's done (usually 30–60 minutes).</p>`,
-        `<p>Track progress: <a href="${statusUrl}">${statusUrl}</a></p>`,
-        `<p><strong>Save your review key:</strong> <code>${reviewKey}</code></p>`,
+        `<p>${escapeHtml(copy.greeting)}</p>`,
+        `<p>${bodyLine}</p>`,
+        `<p>${escapeHtml(copy.track)} <a href="${statusUrl}">${statusUrl}</a></p>`,
+        `<p><strong>${escapeHtml(copy.saveKey)}</strong> <code>${reviewKey}</code></p>`,
         `<p>— coarse</p>`,
       ].join(""),
     });

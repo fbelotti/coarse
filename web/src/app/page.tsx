@@ -4,8 +4,11 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import { useDropzone } from "react-dropzone";
 import { useRouter } from "next/navigation";
 import { CharcoalRule, HeroMarks } from "@/components/charcoal";
-import ModelPicker from "@/components/ModelPicker";
+import ModelPicker, { DEFAULT_REVIEW_MODEL } from "@/components/ModelPicker";
+import LanguagePicker from "@/components/LanguagePicker";
+import SiteLanguageSwitcher from "@/components/SiteLanguageSwitcher";
 import OpenRouterLoginButton from "@/components/OpenRouterLoginButton";
+import { SiteLanguageProvider, useSiteLanguageContext } from "@/lib/i18n";
 import { estimateTokensFromPdf, estimateTokensFromText, estimateTokensFromDocx, estimateTokensFromEpub, getModelPricing, estimateReviewCost } from "@/lib/estimateCost";
 import { beginLogin, completeLogin, loadStoredKey, saveStoredKey, clearStoredKey } from "@/lib/openrouterAuth";
 import {
@@ -15,7 +18,7 @@ import {
   HOST_LABELS,
   HOST_GLYPHS,
   HOST_CLI_NAME,
-  HOST_DEFAULT_MODELS,
+  getHostModels,
   HOST_INSTALL_URL,
   HOST_LAUNCH_LABEL,
   HOST_LAUNCH_HINT,
@@ -68,6 +71,7 @@ function getTurnstileApi(): TurnstileApi | undefined {
 /* ── Split-flap AI name display ────────────────────────────── */
 const AI_NAMES = ["Claude,", "Gemini,", "Qwen,", "ChatGPT,", "DeepSeek,", "Kimi,", "Grok,", "MiniMax,", "Mistral,", "Llama,"];
 const CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const BUY_ME_A_COFFEE_URL = "https://buymeacoffee.com/coarse";
 
 function SplitFlap() {
   const [index, setIndex] = useState(0);
@@ -120,6 +124,7 @@ function SplitFlap() {
 
 /* ── Copy-to-clipboard code block ────────────────────────── */
 function CodeBlock({ text, maxHeight }: { text: string; maxHeight?: string }) {
+  const { t } = useSiteLanguageContext();
   const [copied, setCopied] = useState(false);
   // Wrap the scroll area in a relative container so the copy button
   // can be absolutely positioned over the top-right and stay visible
@@ -150,7 +155,7 @@ function CodeBlock({ text, maxHeight }: { text: string; maxHeight?: string }) {
           transition: "background 0.15s, color 0.15s",
         }}
       >
-        {copied ? "copied ✓" : "copy"}
+        {copied ? t("codeBlockCopied") : t("codeBlockCopy")}
       </button>
       <div
         style={{
@@ -179,6 +184,7 @@ function CodeBlock({ text, maxHeight }: { text: string; maxHeight?: string }) {
 
 /* ── Header ───────────────────────────────────────────────── */
 function Header() {
+  const { t } = useSiteLanguageContext();
   return (
     <header
       style={{
@@ -186,6 +192,8 @@ function Header() {
         display: "flex",
         alignItems: "baseline",
         justifyContent: "space-between",
+        flexWrap: "wrap",
+        gap: "0.75rem 1.5rem",
         background: "var(--board)",
       }}
     >
@@ -208,10 +216,13 @@ function Header() {
             color: "var(--dust)",
           }}
         >
-          peer review is a public good.
+          {t("headerTagline")}
         </span>
       </div>
-      <div style={{ display: "flex", alignItems: "baseline", gap: "1.5rem" }}>
+      <nav
+        aria-label="Primary navigation"
+        style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: "0.75rem 1.5rem" }}
+      >
         <a
           href="/setup"
           style={{
@@ -222,7 +233,7 @@ function Header() {
             transition: "color 0.2s",
           }}
         >
-          setup
+          {t("navSetup")}
         </a>
         <a
           href="/compare"
@@ -234,7 +245,7 @@ function Header() {
             transition: "color 0.2s",
           }}
         >
-          side-by-side
+          {t("navSideBySide")}
         </a>
         <a
           href="https://github.com/Davidvandijcke/coarse"
@@ -248,9 +259,21 @@ function Header() {
             transition: "color 0.2s",
           }}
         >
-          github ↗
+          {t("navGithub")}
         </a>
-      </div>
+        <a
+          className="buy-me-a-coffee-button"
+          href={BUY_ME_A_COFFEE_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          aria-label="Support coarse on Buy Me a Coffee (opens in a new tab)"
+        >
+          <span aria-hidden="true">☕</span>
+          <span>buy me a coffee</span>
+          <span className="buy-me-a-coffee-arrow" aria-hidden="true">↗</span>
+        </a>
+        <SiteLanguageSwitcher />
+      </nav>
     </header>
   );
 }
@@ -274,12 +297,28 @@ function FieldLabel({ children }: { children: React.ReactNode }) {
 
 /* ── Page ──────────────────────────────────────────────────── */
 export default function Home() {
+  // The site-language context must sit ABOVE every consumer (Header,
+  // PageBody, the pickers), so the provider wraps the body here and the
+  // actual page content lives in PageBody, which reads the context.
+  return (
+    <SiteLanguageProvider>
+      <PageBody />
+    </SiteLanguageProvider>
+  );
+}
+
+function PageBody() {
+  const { t } = useSiteLanguageContext();
   const router = useRouter();
   const siteHost = getVisibleSiteHost();
   const [file, setFile] = useState<File | null>(null);
   const [email, setEmail] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [model, setModel] = useState("anthropic/claude-opus-4.8");
+  const [model, setModel] = useState(DEFAULT_REVIEW_MODEL);
+  const [deepLiteratureSearch, setDeepLiteratureSearch] = useState(false);
+  // "" = auto (match the paper's own language). Sent as review_language on
+  // the /api/submit body and threaded into the handoff CLI command.
+  const [reviewLanguage, setReviewLanguage] = useState("");
   const [authorNotes, setAuthorNotes] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -555,9 +594,7 @@ export default function Home() {
     const { key: stored, migratedFromLocalStorage } = loadStoredKey();
 
     if (migratedFromLocalStorage) {
-      setKeyNotice(
-        "Moved your saved OpenRouter key into tab-only storage. It will clear when you close this tab.",
-      );
+      setKeyNotice(t("noticeKeyMigrated"));
     }
 
     if (!code) {
@@ -577,16 +614,18 @@ export default function Home() {
         try {
           saveStoredKey(key);
         } catch {
-          setError(
-            "Logged in, but couldn't keep the key in this tab. You'll need to paste it again if this page reloads.",
-          );
+          setError(t("errorLoginNoPersist"));
         }
       })
       .catch((err) => {
         console.error("OpenRouter login failed", err);
-        setError("OpenRouter login failed. Please try again or paste a key manually.");
+        setError(t("errorLoginFailed"));
         if (stored) setApiKey(stored);
       });
+    // Mount-only: handles the OAuth `?code=` callback + one-time key hydration.
+    // It must NOT re-run when the UI language changes, so `t` is intentionally
+    // omitted from the deps (the locale is always "en" at first paint anyway).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const onDrop = useCallback((accepted: File[]) => {
@@ -627,7 +666,17 @@ export default function Home() {
           // Pass modelId for reasoning-model overhead detection and
           // isPdf to gate the extraction_qa stage — matches the Python
           // cost gate's behavior in build_cost_estimate().
-          setCostEstimate(estimateReviewCost(tokens, pricing, model, ext === "pdf"));
+          setCostEstimate(
+            estimateReviewCost(
+              tokens,
+              pricing,
+              model,
+              ext === "pdf",
+              undefined,
+              true,
+              deepLiteratureSearch,
+            ),
+          );
         } else {
           setCostEstimate(null);
         }
@@ -640,7 +689,7 @@ export default function Home() {
     })();
 
     return () => { cancelled = true; };
-  }, [file, model]);
+  }, [file, model, deepLiteratureSearch]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
@@ -682,12 +731,7 @@ export default function Home() {
       }
     }
     if (resp.status === 401 || resp.status === 403) {
-      return (
-        "Authentication failed. On preview deploys this usually means the " +
-        "browser's cached Basic Auth credentials didn't get sent on the " +
-        "form submit. Refresh the tab (Cmd/Ctrl+Shift+R), sign in again at " +
-        "the password prompt, and retry."
-      );
+      return t("errorAuthFailed");
     }
     if (resp.status === 503) {
       // Every app-emitted 503 is JSON with an `error` field and is
@@ -696,9 +740,9 @@ export default function Home() {
       // body is an HTML error page or a stack trace. We don't want
       // to render raw HTML in an error message, so return a fixed
       // string instead of exposing `rawBody`.
-      return "Service temporarily unavailable — please try again in a minute.";
+      return t("errorServiceUnavailable");
     }
-    return `${fallback} (HTTP ${resp.status})`;
+    return `${fallback}${t("errorHttpMid")}${resp.status})`;
   }
 
   async function handleSubmit(e: React.FormEvent) {
@@ -714,15 +758,10 @@ export default function Home() {
       if (turnstileSiteKey && !turnstileToken) {
         if (turnstileStatus === "failed") {
           throw new Error(
-            "Our human-check widget couldn't load — a browser extension " +
-              "(Brave Shields, uBlock Origin, Firefox ETP strict) is most " +
-              "likely blocking challenges.cloudflare.com. Try disabling it " +
-              `for ${siteHost}, or run coarse locally: uvx coarse-ink review paper.pdf`,
+            `${t("errorTurnstileBlockedPrefix")}${siteHost}${t("errorTurnstileBlockedSuffix")}`,
           );
         }
-        throw new Error(
-          "Still waiting for the human check to load — give it a second and try again.",
-        );
+        throw new Error(t("errorTurnstileWaiting"));
       }
       const presignResp = await fetch("/api/presign", {
         method: "POST",
@@ -730,7 +769,7 @@ export default function Home() {
         body: JSON.stringify({ filename: file.name, turnstile_token: turnstileToken }),
       });
       if (!presignResp.ok) {
-        throw new Error(await readApiError(presignResp, "Failed to prepare upload"));
+        throw new Error(await readApiError(presignResp, t("errorPrepareUpload")));
       }
       const { id, storagePath, signedUrl, token, handoffSecret, accessToken } = await presignResp.json();
 
@@ -744,7 +783,7 @@ export default function Home() {
         body: file,
       });
       if (!uploadResp.ok) {
-        throw new Error("File upload failed — please try again");
+        throw new Error(t("errorUploadFailed"));
       }
 
       // Step 3: Submit metadata (no file — just JSON)
@@ -761,15 +800,17 @@ export default function Home() {
           model,
           storage_path: storagePath,
           author_notes: authorNotes || undefined,
+          deep_literature_search: deepLiteratureSearch,
+          review_language: reviewLanguage,
           handoff_secret: handoffSecret,
         }),
       });
       if (!submitResp.ok) {
-        throw new Error(await readApiError(submitResp, "Submission failed"));
+        throw new Error(await readApiError(submitResp, t("errorSubmissionFailed")));
       }
       router.push(buildReviewPath("status", id, accessToken));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Submission failed");
+      setError(err instanceof Error ? err.message : t("errorSubmissionFailed"));
       setSubmitting(false);
     } finally {
       // Turnstile tokens are single-use per siteverify call, so reset
@@ -797,7 +838,7 @@ export default function Home() {
     setError(null);
     setMcpPickerOpen(false);
     setHandoffPhase("extracting");
-    setHandoffMessage("Uploading paper...");
+    setHandoffMessage(t("handoffUploading"));
     setHandoffBundle(null);
 
     try {
@@ -811,15 +852,10 @@ export default function Home() {
       if (turnstileSiteKey && !turnstileToken) {
         if (turnstileStatus === "failed") {
           throw new Error(
-            "Our human-check widget couldn't load — a browser extension " +
-              "(Brave Shields, uBlock Origin, Firefox ETP strict) is most " +
-              "likely blocking challenges.cloudflare.com. Try disabling it " +
-              `for ${siteHost}, or run coarse locally: uvx coarse-ink review paper.pdf`,
+            `${t("errorTurnstileBlockedPrefix")}${siteHost}${t("errorTurnstileBlockedSuffix")}`,
           );
         }
-        throw new Error(
-          "Still waiting for the human check to load — give it a second and try again.",
-        );
+        throw new Error(t("errorTurnstileWaiting"));
       }
       const presignResp = await fetch("/api/presign", {
         method: "POST",
@@ -827,7 +863,7 @@ export default function Home() {
         body: JSON.stringify({ filename: file.name, turnstile_token: turnstileToken }),
       });
       if (!presignResp.ok) {
-        throw new Error(await readApiError(presignResp, "Failed to prepare upload"));
+        throw new Error(await readApiError(presignResp, t("errorPrepareUpload")));
       }
       const { id, signedUrl, handoffSecret } = await presignResp.json();
 
@@ -840,18 +876,18 @@ export default function Home() {
         body: file,
       });
       if (!uploadResp.ok) {
-        throw new Error("File upload failed — please try again");
+        throw new Error(t("errorUploadFailed"));
       }
 
       // Step 2: mint CLI handoff token. No server-side extraction — the
       // user's local `coarse-review` command downloads the raw PDF and
       // does Mistral OCR locally with their own OpenRouter key, then
       // POSTs the rendered review back to /api/mcp-finalize.
-      setHandoffMessage("Preparing handoff...");
+      setHandoffMessage(t("handoffPreparing"));
       const bundle = await mintCliHandoff(id, host, handoffSecret);
 
       // Step 3: defaults for the modal dropdowns.
-      setSelectedModel(HOST_DEFAULT_MODELS[host][0]);
+      setSelectedModel(getHostModels(host, model)[0]);
       setSelectedEffort("high");
 
       setHandoffBundle(bundle);
@@ -864,7 +900,7 @@ export default function Home() {
       setHandoffMessage("");
     } catch (err) {
       setHandoffPhase("failed");
-      const msg = err instanceof Error ? err.message : "Handoff failed";
+      const msg = err instanceof Error ? err.message : t("errorHandoffFailed");
       setError(msg);
       setHandoffMessage("");
     } finally {
@@ -896,6 +932,8 @@ export default function Home() {
       model: selectedModel,
       effort: selectedEffort,
       paperId: handoffState.paperId,
+      reviewLanguage,
+      deepLiteratureSearch,
     });
 
     // Kick off clipboard copy first, but don't await it before launching
@@ -903,7 +941,8 @@ export default function Home() {
     // awaiting an async clipboard write can consume user activation and
     // cause codex:// / claude:// launches to be blocked.
     const fullPrompt = buildAgentPrompt({
-      setupCmd, runCmd, attachCmd, logFile, isPdf: handoffState.isPdf,
+      setupCmd, runCmd, attachCmd, logFile, isPdf: handoffState.isPdf, reviewLanguage,
+      deepLiteratureSearch,
     });
     navigator.clipboard.writeText(fullPrompt).catch((err) => {
       console.error("clipboard write failed", err);
@@ -916,10 +955,11 @@ export default function Home() {
     // didn't resolve and we swap in a "didn't work — paste the commands
     // instead" hint so the user isn't stuck.
     const launchUrl = buildLaunchUrl({
-      host, runCmd, setupCmd, attachCmd, logFile, isPdf: handoffState.isPdf,
+      host, runCmd, setupCmd, attachCmd, logFile, isPdf: handoffState.isPdf, reviewLanguage,
+      deepLiteratureSearch,
     });
     if (!launchUrl) {
-      setLaunchStatus("Command copied to clipboard. Paste it into your terminal.");
+      setLaunchStatus(t("launchCommandCopied"));
       return;
     }
 
@@ -931,15 +971,14 @@ export default function Home() {
     window.location.href = launchUrl;
     setLaunchStatus(
       host === "codex"
-        ? "Opening Codex desktop app — the composer should pre-fill. Hit send."
-        : `Opening ${HOST_LABELS[host]} — paste the prompt from your clipboard (⌘V / Ctrl+V).`,
+        ? t("launchOpeningCodex")
+        : `${t("launchOpeningPrefix")}${HOST_LABELS[host]}${t("launchOpeningSuffix")}`,
     );
     setTimeout(() => {
       document.removeEventListener("visibilitychange", onVis);
       if (!becameHidden) {
         setLaunchStatus(
-          `${HOST_LABELS[host]} desktop app didn't open. If you only have the CLI ` +
-            `version installed, paste the commands above into your terminal instead.`,
+          `${HOST_LABELS[host]}${t("launchDidntOpenSuffix")}`,
         );
       }
     }, 2500);
@@ -1006,14 +1045,14 @@ export default function Home() {
             }}
           >
             {!systemStatus.accepting
-              ? (systemStatus.banner || "Submissions are temporarily paused.")
+              ? (systemStatus.banner || t("bannerPausedDefault"))
               : systemStatus.banner
                 ? systemStatus.banner
-                : `The system is busy (${systemStatus.activeReviews}/${systemStatus.capacity} slots in use). Your review may be queued.`}
+                : `${t("bannerBusyPrefix")}${systemStatus.activeReviews}/${systemStatus.capacity}${t("bannerBusySuffix")}`}
             {" "}
-            For faster results, try the CLI:{" "}
+            {t("bannerFasterPrefix")}{" "}
             <code style={{ background: "var(--tray)", padding: "0.15em 0.4em", fontSize: "0.95em" }}>
-              pip install coarse-ink
+              {t("bannerPipInstall")}
             </code>{" "}
             <a
               href="https://github.com/Davidvandijcke/coarse"
@@ -1021,7 +1060,7 @@ export default function Home() {
               rel="noopener noreferrer"
               style={{ color: "var(--red-chalk)", textDecoration: "underline", textUnderlineOffset: "2px" }}
             >
-              GitHub
+              {t("bannerGithub")}
             </a>
           </div>
         </div>
@@ -1046,7 +1085,7 @@ export default function Home() {
               margin: "0 0 1.25rem",
             }}
           >
-            Hey <SplitFlap /> can you review this paper?
+            {t("heroGreetingPrefix")}<SplitFlap />{t("heroGreetingSuffix")}
           </p>
 
           <h1
@@ -1060,7 +1099,7 @@ export default function Home() {
               color: "var(--chalk-bright)",
             }}
           >
-            &lsquo;coarse!
+            {t("heroHeading")}
           </h1>
 
           <p
@@ -1072,8 +1111,7 @@ export default function Home() {
               maxWidth: "520px",
             }}
           >
-            AI agents review your paper and write a referee report.
-            You pay the API cost directly. No account.
+            {t("heroLede")}
           </p>
           <p
             style={{
@@ -1085,8 +1123,7 @@ export default function Home() {
               maxWidth: "500px",
             }}
           >
-            Academic peer review runs on unpaid academic labor.
-            Others decided to make a business out of that. We didn&apos;t like that.
+            {t("heroManifesto")}
           </p>
 
           {/* Score preview */}
@@ -1115,15 +1152,15 @@ export default function Home() {
                     marginTop: "0.25rem",
                   }}
                 >
-                  vs. other AI reviewers
+                  {t("scoreVsOthers")}
                 </span>
               </div>
 
               {/* Stats */}
               {[
-                ["< $2*", "per review", "*typically :)"],
-                ["20+", "detailed comments", null],
-                ["MIT", "open source", null],
+                [t("statCostNum"), t("statCostLabel"), t("statCostFootnote")],
+                [t("statCommentsNum"), t("statCommentsLabel"), null],
+                [t("statOpenSourceNum"), t("statOpenSourceLabel"), null],
               ].map(([num, label, footnote]) => (
                 <div key={label} style={{ position: "relative" }}>
                   <span
@@ -1182,11 +1219,11 @@ export default function Home() {
                 maxWidth: "520px",
               }}
             >
-              Blind-evaluated against{" "}
-              <span style={{ color: "var(--chalk-bright)" }}>refine.ink</span>,{" "}
-              <span style={{ color: "var(--chalk-bright)" }}>Stanford Agentic Reviewer</span>, and{" "}
-              <span style={{ color: "var(--chalk-bright)" }}>reviewer3.com</span>.
-              Scores higher on coverage, specificity, and depth -- at a fraction of the cost.
+              {t("comparePrefix")}{" "}
+              <span style={{ color: "var(--chalk-bright)" }}>{t("compareRefine")}</span>,{" "}
+              <span style={{ color: "var(--chalk-bright)" }}>{t("compareStanford")}</span>, and{" "}
+              <span style={{ color: "var(--chalk-bright)" }}>{t("compareReviewer3")}</span>.{" "}
+              {t("compareSuffix")}
             </p>
 
             <a
@@ -1200,7 +1237,7 @@ export default function Home() {
                 textDecoration: "none",
               }}
             >
-              See the side-by-side →
+              {t("compareLink")}
             </a>
           </div>
         </section>
@@ -1217,17 +1254,17 @@ export default function Home() {
               marginBottom: "2.25rem",
             }}
           >
-            Submit a paper
+            {t("formSubmitHeading")}
           </p>
 
           <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "2rem" }}>
             {/* Drop zone */}
             <div>
-              <FieldLabel>Paper</FieldLabel>
+              <FieldLabel>{t("fieldPaper")}</FieldLabel>
               <div
                 {...getRootProps()}
                 role="button"
-                aria-label="Upload your paper — drop a file or click to browse"
+                aria-label={t("dropzoneAriaLabel")}
                 style={{
                   border: `1.5px dashed ${isDragActive ? "var(--yellow-chalk)" : "var(--tray)"}`,
                   padding: "2.25rem 2rem",
@@ -1238,7 +1275,7 @@ export default function Home() {
                   borderRadius: "2px",
                 }}
               >
-                <input {...getInputProps()} aria-label="Choose a file to upload" />
+                <input {...getInputProps()} aria-label={t("dropzoneInputAriaLabel")} />
                 {file ? (
                   <>
                     <p
@@ -1260,7 +1297,7 @@ export default function Home() {
                         margin: "0.375rem 0 0",
                       }}
                     >
-                      {(file.size / 1024 / 1024).toFixed(1)} MB — click or drop to replace
+                      {(file.size / 1024 / 1024).toFixed(1)}{t("dropzoneReplaceSuffix")}
                     </p>
                   </>
                 ) : (
@@ -1273,8 +1310,8 @@ export default function Home() {
                         margin: 0,
                       }}
                     >
-                      Drop your file here, or{" "}
-                      <span style={{ textDecoration: "underline", textUnderlineOffset: "2px" }}>browse</span>
+                      {t("dropzonePromptPrefix")}
+                      <span style={{ textDecoration: "underline", textUnderlineOffset: "2px" }}>{t("dropzoneBrowse")}</span>
                     </p>
                     <p
                       style={{
@@ -1284,7 +1321,7 @@ export default function Home() {
                         margin: "0.375rem 0 0",
                       }}
                     >
-                      Up to 50 MB
+                      {t("dropzoneMaxSize")}
                     </p>
                   </>
                 )}
@@ -1300,15 +1337,15 @@ export default function Home() {
               }}
             >
               <div>
-                <FieldLabel>Email <span style={{ color: "var(--dust)", fontWeight: 400 }}>(for web review only)</span></FieldLabel>
+                <FieldLabel>{t("fieldEmail")}<span style={{ color: "var(--dust)", fontWeight: 400 }}>{t("fieldEmailQualifier")}</span></FieldLabel>
                 <input
                   type="email"
                   required={!emailDisabled}
                   disabled={emailDisabled}
                   value={emailDisabled ? "" : email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder={emailDisabled ? "— unavailable —" : "you@university.edu"}
-                  aria-label="Email address"
+                  placeholder={emailDisabled ? t("emailPlaceholderUnavailable") : t("emailPlaceholder")}
+                  aria-label={t("emailAriaLabel")}
                   className="field-line"
                   style={emailDisabled ? { opacity: 0.55, cursor: "not-allowed" } : undefined}
                 />
@@ -1321,14 +1358,14 @@ export default function Home() {
                   }}
                 >
                   {emailDisabled
-                    ? "Email delivery is temporarily down. Save your review key when you submit and check back in about an hour."
-                    : <>We&apos;ll email you when it&apos;s done. Check your spam folder if you don&apos;t see it.</>}
+                    ? t("emailHelperDisabled")
+                    : t("emailHelperPrefix")}
                 </p>
               </div>
 
               <div>
                 <FieldLabel>
-                  OpenRouter key{" "}
+                  {t("fieldKey")}{" "}
                   <a
                     href="/setup"
                     style={{
@@ -1336,7 +1373,7 @@ export default function Home() {
                       textDecoration: "none",
                     }}
                   >
-                    get one →
+                    {t("fieldKeyGetOne")}
                   </a>
                 </FieldLabel>
                 <div style={{ marginBottom: "0.9rem" }}>
@@ -1345,7 +1382,7 @@ export default function Home() {
                     onLogin={() => {
                       beginLogin(window.location.origin + "/").catch((err) => {
                         setError(
-                          `OpenRouter login could not start: ${err instanceof Error ? err.message : String(err)}`,
+                          `${t("errorLoginCouldNotStartPrefix")}${err instanceof Error ? err.message : String(err)}`,
                         );
                       });
                     }}
@@ -1365,7 +1402,7 @@ export default function Home() {
                       margin: "0 0 0.4rem",
                     }}
                   >
-                    — or paste a key —
+                    {t("keyOrPaste")}
                   </p>
                 )}
                 <input
@@ -1373,8 +1410,8 @@ export default function Home() {
                   required
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
-                  placeholder="sk-or-v1-…"
-                  aria-label="OpenRouter API key"
+                  placeholder={t("keyPlaceholder")}
+                  aria-label={t("keyAriaLabel")}
                   className="field-line-mono"
                 />
                 <p
@@ -1385,7 +1422,7 @@ export default function Home() {
                     marginTop: "0.4rem",
                   }}
                 >
-                  OAuth keys stay in this tab only and clear when you close it. Never saved on our servers.
+                  {t("keyHelper")}
                 </p>
                 {keyNotice && (
                   <p
@@ -1405,19 +1442,86 @@ export default function Home() {
             {/* Model picker */}
             <ModelPicker value={model} onChange={setModel} />
 
+            {/* Review language — applies to both the OpenRouter submit and
+                the subscription-handoff command. "" = auto (paper's own
+                language), which keeps both paths unchanged from today. */}
+            <LanguagePicker
+              value={reviewLanguage}
+              onChange={setReviewLanguage}
+              disabled={submitting || handoffBusy}
+            />
+
+            {/* Optional Perplexity Sonar Deep Research pass. This choice is
+                forwarded through both the hosted worker and subscription
+                handoff command so the two submit paths stay behaviorally
+                aligned. */}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "1.25rem",
+                padding: "0.8rem 0.95rem",
+                border: "1px solid var(--tray)",
+                borderRadius: "2px",
+                background: "var(--board-surface)",
+              }}
+            >
+              <div>
+                <FieldLabel>{t("deepLiteratureLabel")}</FieldLabel>
+                <p
+                  id="deep-literature-helper"
+                  style={{
+                    fontFamily: "var(--font-chalk)",
+                    fontSize: "1rem",
+                    color: "var(--dust)",
+                    lineHeight: 1.45,
+                    margin: 0,
+                    maxWidth: "590px",
+                  }}
+                >
+                  {t("deepLiteratureHelper")}
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={deepLiteratureSearch}
+                aria-describedby="deep-literature-helper"
+                aria-label={t("deepLiteratureLabel")}
+                disabled={submitting || handoffBusy}
+                onClick={() => setDeepLiteratureSearch((enabled) => !enabled)}
+                style={{
+                  flexShrink: 0,
+                  minWidth: "5.5rem",
+                  padding: "0.45rem 0.75rem",
+                  border: `1px solid ${deepLiteratureSearch ? "var(--yellow-chalk)" : "var(--tray)"}`,
+                  borderRadius: "999px",
+                  background: deepLiteratureSearch ? "var(--yellow-chalk)" : "var(--board)",
+                  color: deepLiteratureSearch ? "var(--board)" : "var(--chalk)",
+                  fontFamily: "var(--font-space-mono), monospace",
+                  fontSize: "0.95rem",
+                  cursor: submitting || handoffBusy ? "not-allowed" : "pointer",
+                  opacity: submitting || handoffBusy ? 0.55 : 1,
+                }}
+              >
+                {deepLiteratureSearch ? `● ${t("deepLiteratureOn")}` : `○ ${t("deepLiteratureOff")}`}
+              </button>
+            </div>
+
             {/* Optional author notes — steer the review */}
             <div>
               <FieldLabel>
-                Notes for the reviewer{" "}
-                <span style={{ color: "var(--dust)", fontSize: "0.85em" }}>(optional)</span>
+                {t("fieldNotes")}{" "}
+                <span style={{ color: "var(--dust)", fontSize: "0.85em" }}>{t("fieldNotesOptional")}</span>
               </FieldLabel>
               <textarea
                 value={authorNotes}
                 onChange={(e) => setAuthorNotes(e.target.value.slice(0, 2000))}
-                placeholder="e.g. please focus on the identification strategy in §3 — the data section is still a placeholder."
+                placeholder={t("notesPlaceholder")}
                 rows={3}
                 maxLength={2000}
-                aria-label="Optional notes to steer the reviewer"
+                aria-label={t("notesAriaLabel")}
                 className="field-line-textarea"
               />
               <p
@@ -1430,7 +1534,7 @@ export default function Home() {
                   justifyContent: "space-between",
                 }}
               >
-                <span>Steer what the reviewer focuses on. Does not override the rubric.</span>
+                <span>{t("notesHelper")}</span>
                 <span style={{ fontVariantNumeric: "tabular-nums" }}>{authorNotes.length}/2000</span>
               </p>
             </div>
@@ -1446,10 +1550,10 @@ export default function Home() {
                 }}
               >
                 {costLoading
-                  ? "Estimating cost..."
+                  ? t("costEstimating")
                   : costEstimate !== null
-                    ? `Estimated API cost: $${costEstimate < 0.01 ? costEstimate.toFixed(4) : costEstimate.toFixed(2)}`
-                    : "Cost estimate unavailable for this model"}
+                    ? `${t("costEstimatePrefix")}${costEstimate < 0.01 ? costEstimate.toFixed(4) : costEstimate.toFixed(2)}`
+                    : t("costUnavailable")}
               </p>
             )}
 
@@ -1474,36 +1578,29 @@ export default function Home() {
                     }}
                   >
                     <p style={{ margin: "0 0 0.6rem" }}>
-                      Our human check couldn&apos;t complete. Something is
-                      blocking or slowing{" "}
+                      {t("turnstileFailedLine1Prefix")}
                       <code style={{ fontFamily: "var(--font-space-mono), monospace" }}>
-                        challenges.cloudflare.com
-                      </code>{" "}
-                      — usually a strict browser privacy mode (such as
-                      Safari&apos;s tracking prevention or Firefox ETP strict), a
-                      content/ad blocker (Brave Shields, uBlock Origin on some
-                      lists), or a slow or filtered network.
+                        {t("turnstileChallengesHost")}
+                      </code>
+                      {t("turnstileFailedLine1Suffix")}
                     </p>
                     <p style={{ margin: "0 0 0.6rem" }}>
-                      Try reloading the page first. If it persists, allow{" "}
+                      {t("turnstileFailedLine2Prefix")}
                       <code style={{ fontFamily: "var(--font-space-mono), monospace" }}>
-                        challenges.cloudflare.com
-                      </code>{" "}
-                      for{" "}
+                        {t("turnstileChallengesHost")}
+                      </code>
+                      {t("turnstileFailedLine2Mid")}
                       <code style={{ fontFamily: "var(--font-space-mono), monospace" }}>
                         {siteHost}
-                      </code>{" "}
-                      (disable content blockers or relax privacy settings), or
-                      use a different browser. On a preview URL, the deployment
-                      may also need that hostname on the Cloudflare Turnstile
-                      widget allowlist.
+                      </code>
+                      {t("turnstileFailedLine2Suffix")}
                     </p>
                     <p style={{ margin: 0 }}>
-                      Or run coarse locally with your own OpenRouter key:{" "}
+                      {t("turnstileFailedLine3Prefix")}
                       <code style={{ fontFamily: "var(--font-space-mono), monospace" }}>
-                        uvx coarse-ink review paper.pdf
+                        {t("turnstileUvxCommand")}
                       </code>
-                      .
+                      {t("turnstileFailedLine3Suffix")}
                     </p>
                   </div>
                 )}
@@ -1542,7 +1639,7 @@ export default function Home() {
                     borderRadius: "2px",
                   }}
                 >
-                  {submitting ? "Submitting..." : "Review my paper"}
+                  {submitting ? t("submitButtonBusy") : t("submitButton")}
                 </button>
 
                 <span
@@ -1552,7 +1649,7 @@ export default function Home() {
                     color: "var(--dust)",
                   }}
                 >
-                  or
+                  {t("submitOr")}
                 </span>
 
                 <div style={{ position: "relative" }}>
@@ -1575,7 +1672,7 @@ export default function Home() {
                     aria-expanded={mcpPickerOpen}
                     aria-haspopup="listbox"
                   >
-                    {handoffBusy ? "Preparing..." : "Review with my subscription ▾"}
+                    {handoffBusy ? t("handoffButtonBusy") : t("handoffButton")}
                   </button>
 
                   {handoffBusy && handoffMessage && (
@@ -1667,8 +1764,8 @@ export default function Home() {
                   lineHeight: 1.5,
                 }}
               >
-                <strong style={{ color: "var(--chalk)" }}>Review my paper:</strong>
-                {" "}OpenRouter handles everything end-to-end. File deleted after processing. Review key works for 90 days. Usually under $2.
+                <strong style={{ color: "var(--chalk)" }}>{t("explainReviewLabel")}</strong>
+                {t("explainReviewBody")}
               </p>
               <p
                 style={{
@@ -1680,27 +1777,23 @@ export default function Home() {
                   lineHeight: 1.5,
                 }}
               >
-                <strong style={{ color: "var(--chalk)" }}>Review with my subscription:</strong>
-                {" "}we hand you a shell command that runs the full coarse pipeline
-                locally using <em>your</em>{" "}
-                <a href="https://claude.ai/download" target="_blank" rel="noopener noreferrer" style={{ color: "var(--blue-chalk)", textDecoration: "none" }}>Claude Code</a>,{" "}
-                <a href="https://github.com/openai/codex" target="_blank" rel="noopener noreferrer" style={{ color: "var(--blue-chalk)", textDecoration: "none" }}>Codex</a>, or{" "}
-                <a href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener noreferrer" style={{ color: "var(--blue-chalk)", textDecoration: "none" }}>Gemini CLI</a>{" "}
-                subscription for the LLM reasoning.{" "}
+                <strong style={{ color: "var(--chalk)" }}>{t("explainSubscriptionLabel")}</strong>
+                {" "}{t("explainSubscriptionPart1")}
+                <em>{t("explainSubscriptionYour")}</em>{" "}
+                <a href="https://claude.ai/download" target="_blank" rel="noopener noreferrer" style={{ color: "var(--blue-chalk)", textDecoration: "none" }}>{t("explainSubscriptionClaudeCode")}</a>{t("explainSubscriptionCommaCodex")}{" "}
+                <a href="https://github.com/openai/codex" target="_blank" rel="noopener noreferrer" style={{ color: "var(--blue-chalk)", textDecoration: "none" }}>{t("explainSubscriptionCodex")}</a>{t("explainSubscriptionOr")}{" "}
+                <a href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener noreferrer" style={{ color: "var(--blue-chalk)", textDecoration: "none" }}>{t("explainSubscriptionGeminiCli")}</a>{" "}
+                {t("explainSubscriptionPart2")}{" "}
                 {selectedFileIsPdf ? (
                   <>
-                    You only pay ~$0.10 for the local Mistral OCR step (with
-                    your own OpenRouter key); non-PDF uploads (.tex, .md,
-                    .docx, …) skip OCR and need no OpenRouter key.
+                    {t("explainSubscriptionPdf")}
                   </>
                 ) : (
                   <>
-                    Your file is not a PDF, so it skips the Mistral OCR step
-                    entirely — the whole run is covered by your subscription,
-                    no OpenRouter key needed.
+                    {t("explainSubscriptionNonPdf")}
                   </>
                 )}{" "}
-                Review shows up on this page when done.
+                {t("explainSubscriptionPart3")}
               </p>
               <p
                 style={{
@@ -1712,11 +1805,7 @@ export default function Home() {
                   lineHeight: 1.5,
                 }}
               >
-                Runs locally on your machine using your own Claude Code, Codex,
-                or Gemini CLI account. coarse.ink does not receive or store your
-                provider login, and your provider&apos;s terms, usage limits, and
-                organization policies apply. coarse.ink is not affiliated with
-                Anthropic, OpenAI, or Google.
+                {t("explainDisclaimer")}
               </p>
 
               {handoffBundle && handoffState && (() => {
@@ -1727,6 +1816,8 @@ export default function Home() {
                   model: selectedModel,
                   effort: selectedEffort,
                   paperId: handoffState.paperId,
+                  reviewLanguage,
+                  deepLiteratureSearch,
                 });
                 return (
                   <div
@@ -1749,23 +1840,23 @@ export default function Home() {
                       <span style={{ color: "var(--yellow-chalk)" }}>
                         {HOST_GLYPHS[host]}
                       </span>{" "}
-                      Review with <strong>{HOST_LABELS[host]}</strong>
+                      {t("handoffReviewWithPrefix")}<strong>{HOST_LABELS[host]}</strong>
                     </p>
 
                     {/* Model + effort dropdowns */}
                     <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "1rem" }}>
                       <label style={{ fontFamily: "var(--font-chalk)", fontSize: "0.95rem", color: "var(--dust)" }}>
-                        model{" "}
+                        {t("handoffModelLabel")}{" "}
                         <select
                           value={selectedModel}
                           onChange={(e) => setSelectedModel(e.target.value)}
                           style={{ marginLeft: "0.25rem", padding: "0.25rem 0.5rem", background: "var(--board)", color: "var(--chalk)", border: "1px solid var(--tray)", borderRadius: "2px", fontFamily: "monospace", fontSize: "0.92rem" }}
                         >
-                          {HOST_DEFAULT_MODELS[host].map((m) => (<option key={m} value={m}>{m}</option>))}
+                          {getHostModels(host, model).map((m) => (<option key={m} value={m}>{m}</option>))}
                         </select>
                       </label>
                       <label style={{ fontFamily: "var(--font-chalk)", fontSize: "0.95rem", color: "var(--dust)" }}>
-                        effort{" "}
+                        {t("handoffEffortLabel")}{" "}
                         <select
                           value={selectedEffort}
                           onChange={(e) => setSelectedEffort(e.target.value as EffortLevel)}
@@ -1790,12 +1881,13 @@ export default function Home() {
                           marginBottom: "0.5rem",
                         }}
                       >
-                        Paste this prompt into your {HOST_LABELS[host]} terminal:
+                        {t("handoffPastePromptPrefix")}{HOST_LABELS[host]}{t("handoffPastePromptSuffix")}
                       </div>
                       <CodeBlock
                         text={buildAgentPrompt({
                           setupCmd, runCmd, attachCmd, logFile,
-                          isPdf: handoffState.isPdf,
+                          isPdf: handoffState.isPdf, reviewLanguage,
+                          deepLiteratureSearch,
                         })}
                         maxHeight="160px"
                       />
@@ -1808,11 +1900,9 @@ export default function Home() {
                           lineHeight: 1.5,
                         }}
                       >
-                        The agent will refresh the coarse-review skill, run
-                        the full review locally, and take 10&ndash;25 minutes.
-                        Your provider login stays on your machine.
+                        {t("handoffRunHint")}
                       </p>
-                      {handoffState.isPdf ? (
+                      {handoffState.isPdf || deepLiteratureSearch ? (
                         <p
                           style={{
                             fontFamily: "var(--font-chalk)",
@@ -1822,13 +1912,7 @@ export default function Home() {
                             lineHeight: 1.5,
                           }}
                         >
-                          Your OpenRouter key needs to be on your machine first
-                          — export <code style={{ fontFamily: "var(--font-space-mono), monospace", fontSize: "0.88rem" }}>OPENROUTER_API_KEY</code>,
-                          or put it in <code style={{ fontFamily: "var(--font-space-mono), monospace", fontSize: "0.88rem" }}>.env</code>{" "}
-                          or <code style={{ fontFamily: "var(--font-space-mono), monospace", fontSize: "0.88rem" }}>~/.coarse/config.toml</code>.
-                          We don&apos;t pass it through the browser because the
-                          handoff URL ends up in your agent&apos;s chat log. If
-                          it&apos;s missing, the agent will ask.
+                          {t("handoffKeyNeededPrefix")}<code style={{ fontFamily: "var(--font-space-mono), monospace", fontSize: "0.88rem" }}>{t("handoffKeyEnvVar")}</code>{t("handoffKeyNeededMid1")}<code style={{ fontFamily: "var(--font-space-mono), monospace", fontSize: "0.88rem" }}>{t("handoffKeyEnvFile")}</code>{t("handoffKeyNeededMid2")}<code style={{ fontFamily: "var(--font-space-mono), monospace", fontSize: "0.88rem" }}>{t("handoffKeyConfigFile")}</code>{t("handoffKeyNeededSuffix")}
                         </p>
                       ) : (
                         <p
@@ -1840,9 +1924,7 @@ export default function Home() {
                             lineHeight: 1.5,
                           }}
                         >
-                          No OpenRouter key needed for this paper — it&apos;s
-                          not a PDF, so extraction runs locally without the
-                          Mistral OCR step.
+                          {t("handoffKeyNotNeeded")}
                         </p>
                       )}
                     </div>
@@ -1857,7 +1939,7 @@ export default function Home() {
                         lineHeight: 1.55,
                       }}
                     >
-                      When the review finishes, it will appear at:
+                      {t("handoffReviewUrlIntro")}
                     </p>
                     <a
                       href={`/review/${handoffState.paperId}`}
@@ -1927,9 +2009,9 @@ export default function Home() {
                         margin: "1rem 0 0",
                       }}
                     >
-                      Don&apos;t have {HOST_LABELS[host]} yet?{" "}
+                      {t("handoffInstallPrefix")}{HOST_LABELS[host]}{t("handoffInstallSuffix")}
                       <a href={HOST_INSTALL_URL[host]} target="_blank" rel="noopener noreferrer" style={{ color: "var(--blue-chalk)", textDecoration: "none" }}>
-                        install it →
+                        {t("handoffInstallLink")}
                       </a>
                     </p>
                   </div>
@@ -1951,7 +2033,7 @@ export default function Home() {
               marginBottom: "1.25rem",
             }}
           >
-            Find a review
+            {t("findReviewHeading")}
           </p>
 
           <div style={{ display: "flex", gap: "0.875rem", alignItems: "flex-end" }}>
@@ -1969,8 +2051,8 @@ export default function Home() {
                   }
                 }
               }}
-              placeholder="Paste your review key, full review link, or legacy review ID..."
-              aria-label="Review key"
+              placeholder={t("findReviewPlaceholder")}
+              aria-label={t("findReviewAriaLabel")}
               className="field-line-mono"
               style={{ maxWidth: "480px" }}
             />
@@ -1998,7 +2080,7 @@ export default function Home() {
                 borderRadius: "2px",
               }}
             >
-              Find
+              {t("findReviewButton")}
             </button>
           </div>
         </section>
@@ -2022,7 +2104,7 @@ export default function Home() {
               textDecoration: "none",
             }}
           >
-            privacy
+            {t("footerPrivacy")}
           </a>
           <a
             href="/terms"
@@ -2033,7 +2115,7 @@ export default function Home() {
               textDecoration: "none",
             }}
           >
-            terms
+            {t("footerTerms")}
           </a>
           <a
             href="mailto:dvdijcke@umich.edu"
@@ -2044,7 +2126,7 @@ export default function Home() {
               textDecoration: "none",
             }}
           >
-            contact
+            {t("footerContact")}
           </a>
         </footer>
       </main>

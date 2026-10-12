@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from coarse.models import (
     _NON_REASONING_SUBSTRINGS,
+    FUSION_INPUT_COST_PER_TOKEN,
+    FUSION_MODEL,
+    FUSION_OUTPUT_COST_PER_TOKEN,
     REASONING_MODEL_PREFIXES,
     REASONING_MODEL_SUBSTRINGS,
 )
@@ -55,6 +58,22 @@ FIXED_STAGE_INPUT_TOKENS: dict[str, int] = {
 
 # Flat-fee stages
 LITERATURE_FLAT_COST = 0.03
+# Sonar Deep Research commonly runs around 30 searches ($0.15) plus citation,
+# reasoning, input, and output tokens. $0.25 is a representative request cost;
+# the normal 30% estimate buffer is applied to the final review total.
+DEEP_LITERATURE_FLAT_COST = 0.25
+
+# Representative per-token pricing for models OpenRouter reports as dynamic
+# (``-1`` prompt/completion cost) — currently only OpenRouter Fusion. The web
+# estimator can't price a ``-1`` model, so it substitutes these. Sourced from
+# models.py so the web and Python cost paths can't drift. See the FUSION_MODEL
+# note in models.py for how the rates were measured.
+DYNAMIC_PRICING_OVERRIDES: dict[str, dict[str, float]] = {
+    FUSION_MODEL: {
+        "prompt": FUSION_INPUT_COST_PER_TOKEN,
+        "completion": FUSION_OUTPUT_COST_PER_TOKEN,
+    },
+}
 
 # Conservative multiplier applied to the final total.
 COST_BUFFER = 1.30
@@ -126,9 +145,11 @@ def export_web_spec() -> dict[str, object]:
         "reasoningOverheadMultiplier": REASONING_OVERHEAD_MULTIPLIER,
         "fixedStageInputTokens": FIXED_STAGE_INPUT_TOKENS,
         "literatureFlatCost": LITERATURE_FLAT_COST,
+        "deepLiteratureFlatCost": DEEP_LITERATURE_FLAT_COST,
         "costBuffer": COST_BUFFER,
         "stageOutputTokens": STAGE_OUTPUT_TOKENS,
         "reasoningModelPrefixes": list(REASONING_MODEL_PREFIXES),
         "reasoningModelSubstrings": list(REASONING_MODEL_SUBSTRINGS),
         "nonReasoningSubstrings": list(_NON_REASONING_SUBSTRINGS),
+        "dynamicPricingOverrides": DYNAMIC_PRICING_OVERRIDES,
     }

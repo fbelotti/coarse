@@ -124,7 +124,7 @@ export async function POST(request: NextRequest) {
   }
 
   // Derive the handoff URL the CLI will fetch from. In production this
-  // is coarse.vercel.app (always reachable). In local dev it falls back
+  // is coarse.ink (always reachable). In local dev it falls back
   // to the request origin (localhost:3000) — which works when the CLI
   // runs on the same machine but breaks if it runs in a remote sandbox
   // (e.g. Codex cloud). For local dev with remote CLIs, set
@@ -159,18 +159,19 @@ export async function POST(request: NextRequest) {
   const baseHandoffUrl = `${siteUrl.replace(/\/$/, "")}/h/${tokenRow.token}`;
   const handoffUrl = appendPreviewBypassQuery(baseHandoffUrl);
 
-  const isPreview = process.env.VERCEL_ENV === "preview";
-  const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET ?? "";
   const warnings: string[] = [];
   if (siteUrl.includes("localhost") || siteUrl.includes("127.0.0.1")) {
     warnings.push(
       "Handoff URL uses a loopback address — the CLI must run on this same machine. For remote CLIs, set NEXT_PUBLIC_SITE_URL to a public URL.",
     );
   }
-  if (isPreview && !bypassSecret) {
-    warnings.push(
-      "Preview deployment detected but VERCEL_AUTOMATION_BYPASS_SECRET is unset — the CLI fetch will hit Vercel Preview Protection and fail with HTTP 401. Set the bypass secret on the preview environment (see deploy/PREVIEW_ENVIRONMENTS.md).",
-    );
+  if (process.env.VERCEL_ENV === "preview") {
+    const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET ?? "";
+    if (!bypassSecret) {
+      warnings.push(
+        "Preview deployment detected but VERCEL_AUTOMATION_BYPASS_SECRET is unset — the CLI fetch will hit Vercel Preview Protection and fail with HTTP 401. Set the bypass secret on the preview environment (see deploy/PREVIEW_ENVIRONMENTS.md).",
+      );
+    }
   }
 
   return NextResponse.json({

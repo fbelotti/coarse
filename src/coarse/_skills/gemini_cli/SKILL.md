@@ -4,16 +4,16 @@ description: >
   Produce a rigorous academic peer review of a research paper, manuscript,
   or preprint (PDF, markdown, TeX, DOCX, HTML, or EPUB) using the full
   coarse pipeline with the user's local Gemini CLI (Google AI subscription)
-  doing all the LLM reasoning. Every pipeline stage — structure analysis,
+  doing all the review reasoning. Every review-reasoning stage — structure analysis,
   overview synthesis, per-section review, proof verification, editorial
   pass — is served by a headless `gemini -p` subprocess instead of a
-  paid API. Use when the user asks to review, critique, referee, or
+  paid API; PDF vision QA keeps its configured OpenRouter route. Use when the user asks to review, critique, referee, or
   provide feedback on an academic paper. Takes 10-25 minutes.
 ---
 
 # coarse-review (Gemini)
 
-Runs the **full coarse review pipeline** on a paper using the local `gemini -p` CLI as the LLM backend. Every LLM call is served by a headless Gemini subprocess using the user's Google AI Pro / Ultra subscription. The only per-paper cost is the ~$0.05-0.15 Mistral OCR extraction for PDF sources, which uses the user's OpenRouter key locally — non-PDF sources (.tex, .md, .txt, .docx, .html, .epub) extract locally with no OpenRouter key at all.
+Runs the **full coarse review pipeline** on a paper using the local `gemini -p` CLI as the review-reasoning backend. Review reasoning is served by headless Gemini subprocesses using the user's Google AI Pro / Ultra subscription. PDF sources use the user's OpenRouter key locally for ~$0.05-0.15 Mistral OCR and for a small post-extraction vision-QA charge when that check runs; non-PDF sources (.tex, .md, .txt, .docx, .html, .epub) extract locally with no OpenRouter key at all.
 
 ## Prerequisites
 
@@ -28,27 +28,27 @@ Runs the **full coarse review pipeline** on a paper using the local `gemini -p` 
   - If `uv` exists but `uvx` does not, replace `uvx --python 3.12 --from ...` below with
     `uv tool run --python 3.12 --from ...`.
 - Refresh the bundled `coarse-review` skill with an ephemeral install:
-  `uvx --python 3.12 --from 'coarse-ink==1.7.0' coarse install-skills --all --force`
+  `uvx --python 3.12 --from 'coarse-ink==1.9.6' coarse install-skills --all --force`
   (If that fails with `No such command 'install-skills'`, you're on a
   PyPI release that predates the command — upgrade or ignore; the skill
   bundle is also loadable directly via `uvx --from` without install.)
-- **OpenRouter API key required for PDF papers only** — Mistral OCR extraction (~$0.10 per paper) runs on PDFs alone. Non-PDF sources (.tex, .md, .txt, .docx, .html, .epub) extract locally and need no OpenRouter key at all: skip the probes below and never block a non-PDF review on a missing key. Prefer checking for the key with presence-only probes so you don't needlessly echo its value into the transcript, but if the user hands you the key directly just save it — don't lecture them.
+- **OpenRouter API key required for PDF papers or an explicitly requested deep literature search** — PDFs use Mistral OCR (~$0.10 per paper) plus a small vision-QA charge when that check runs. Standard non-PDF reviews extract locally and need no OpenRouter key; `--deep-literature-search` uses Perplexity Sonar Deep Research for any format and normally adds about $0.30. Skip the probes below only when both conditions are absent. Prefer checking for the key with presence-only probes so you don't needlessly echo its value into the transcript, but if the user hands you the key directly just save it — don't lecture them.
 
-  For PDF papers, before running the review, check whether `OPENROUTER_API_KEY` is already configured:
+  For PDF papers, or whenever deep literature search is requested, check whether `OPENROUTER_API_KEY` is already configured before running:
   - In the environment: `test -n "$OPENROUTER_API_KEY" && echo "env: set" || echo "env: missing"`
   - In a `.env` file in the current directory: `test -f .env && grep -q '^OPENROUTER_API_KEY=' .env && echo ".env: set" || echo ".env: missing"`
 
-  If the paper is a PDF and neither probe reports "set", ask the user:
+  If the paper is a PDF or deep literature was requested and neither probe reports "set", ask the user:
 
-  > I need an OpenRouter API key for the OCR extraction step (~$0.10 per paper). A few options:
+  > I need an OpenRouter API key for PDF OCR (~$0.10) and/or the requested deep literature search (~$0.30). A few options:
   >
-  > 1. Paste the key here and I'll save it to `~/.coarse/config.toml` via `uvx --python 3.12 --from 'coarse-ink==1.7.0' coarse setup`. Note the key passes through the LLM provider (Google) on its way to me, so treat it as slightly less private than one you typed into a local terminal — rotate at https://openrouter.ai/settings/keys if that worries you.
+  > 1. Paste the key here and I'll save it to `~/.coarse/config.toml` via `uvx --python 3.12 --from 'coarse-ink==1.9.6' coarse setup`. Note the key passes through the LLM provider (Google) on its way to me, so treat it as slightly less private than one you typed into a local terminal — rotate at https://openrouter.ai/settings/keys if that worries you.
   > 2. Set it yourself in a separate terminal: `export OPENROUTER_API_KEY=sk-or-v1-...` or add it to `.env` in your current directory, then re-ask me.
-  > 3. Run `uvx --python 3.12 --from 'coarse-ink==1.7.0' coarse setup` in a separate terminal yourself and paste the key into its interactive prompt — the key never touches this chat.
+  > 3. Run `uvx --python 3.12 --from 'coarse-ink==1.9.6' coarse setup` in a separate terminal yourself and paste the key into its interactive prompt — the key never touches this chat.
   >
   > Which do you want?
 
-  If the user pastes a key here, save it via `uvx --python 3.12 --from 'coarse-ink==1.7.0' coarse setup` with the pasted value and confirm it's stored. Their chat, their choice.
+  If the user pastes a key here, save it via `uvx --python 3.12 --from 'coarse-ink==1.9.6' coarse setup` with the pasted value and confirm it's stored. Their chat, their choice.
 - `gemini` CLI signed in (first run prompts for OAuth).
 
 ## How to run
@@ -63,12 +63,12 @@ Use a **per-review unique log file** so parallel runs don't clobber each other's
 LOG=/tmp/coarse-review-$(date +%s).log
 
 # STEP 2a — launch (returns in ~2s with Review PID + Log file)
-uvx --python 3.12 --from 'coarse-ink==1.7.0' \
+uvx --python 3.12 --from 'coarse-ink==1.9.6' \
   coarse-review --detach --log-file "$LOG" \
-  <paper_path_or_handoff_url> --host gemini [--model gemini-3.1-pro-preview] [--effort high]
+  <paper_path_or_handoff_url> --host gemini [--model gemini-3.6-flash] [--effort high] [--deep-literature-search]
 
 # STEP 2b — wait (one blocking call, ~10-25 min, emits heartbeats)
-uvx --python 3.12 --from 'coarse-ink==1.7.0' \
+uvx --python 3.12 --from 'coarse-ink==1.9.6' \
   coarse-review --attach "$LOG"
 ```
 
@@ -83,7 +83,7 @@ rg '^  view:|^  local:' "$LOG"
 If `local:` is present, read that exact file. If `view:` is present, use that URL (it already includes the signed access token — use it as-is). Do not run broad filesystem searches trying to rediscover the review file.
 If `view:` says `unavailable`, report the callback failure and use only the `local:` path.
 
-Available models: `gemini-3.1-pro-preview` (default), `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview`.
+Available models: `gemini-3.6-flash` (default), `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview`.
 Available effort levels: `low`, `medium`, `high` (default), `max`.
 
 **Handoff mode** (when the user came from the coarse web form): the paper is a REMOTE resource at the handoff URL. Do NOT search for a local PDF. Same two-step launch+attach pattern — coarse-review fetches the paper over the network:
@@ -92,12 +92,12 @@ Available effort levels: `low`, `medium`, `high` (default), `max`.
 LOG=/tmp/coarse-review-$(date +%s).log
 
 # STEP 2a — launch
-uvx --python 3.12 --from 'coarse-ink==1.7.0' \
+uvx --python 3.12 --from 'coarse-ink==1.9.6' \
   coarse-review --detach --log-file "$LOG" \
   --handoff https://coarse.ink/h/<token> --host gemini
 
 # STEP 2b — wait
-uvx --python 3.12 --from 'coarse-ink==1.7.0' \
+uvx --python 3.12 --from 'coarse-ink==1.9.6' \
   coarse-review --attach "$LOG"
 ```
 

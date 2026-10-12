@@ -4,16 +4,194 @@ ALL model IDs live here. Never hardcode model strings elsewhere — import from
 this module. Verify IDs against OpenRouter before changing:
     python3 ~/.claude/skills/latest-models/scripts/fetch_models.py --search=<model>
 
-Last verified: 2026-03-04
+Last verified: 2026-10-05
 """
 
 import re
 
-# Primary review model (routed via OpenRouter for non-direct providers)
-DEFAULT_MODEL = "qwen/qwen3.5-plus-02-15"
+# Current featured review models. Keeping their canonical OpenRouter IDs here
+# lets the runtime cost registry and the public defaults move together when a
+# provider ships a new generation.
+CLAUDE_OPUS_5_MODEL = "anthropic/claude-opus-5"
+CLAUDE_SONNET_5_MODEL = "anthropic/claude-sonnet-5"
+CLAUDE_FABLE_5_MODEL = "anthropic/claude-fable-5"
+GPT_5_6_SOL_MODEL = "openai/gpt-5.6-sol"
+# OpenRouter-only variant ID for Sol's "pro" reasoning mode. The OpenAI API has
+# no model by this name — direct-OpenAI requests must be rewritten to the base
+# Sol ID plus a `reasoning: {"mode": "pro"}` body on the Responses API (see
+# DIRECT_RESPONSES_MODEL_ALIASES below). Pricing is identical to base Sol on
+# OpenRouter (verified 2026-08-30); pro mode just spends more reasoning tokens.
+GPT_5_6_SOL_PRO_MODEL = "openai/gpt-5.6-sol-pro"
+GPT_5_6_TERRA_MODEL = "openai/gpt-5.6-terra"
+GPT_5_6_LUNA_MODEL = "openai/gpt-5.6-luna"
+GEMINI_3_6_FLASH_MODEL = "google/gemini-3.6-flash"
+GEMINI_3_1_PRO_MODEL = "google/gemini-3.1-pro-preview"
+QWEN_3_7_PLUS_MODEL = "qwen/qwen3.7-plus"
+KIMI_K3_MODEL = "moonshotai/kimi-k3"
+DEEPSEEK_V4_PRO_MODEL = "deepseek/deepseek-v4-pro"
+GROK_4_5_MODEL = "x-ai/grok-4.5"
+LLAMA_4_MAVERICK_MODEL = "meta-llama/llama-4-maverick"
+GLM_5_2_MODEL = "z-ai/glm-5.2"
+GLM_5_3_FLASH_MODEL = "z-ai/glm-5.3-flash"
 
-# Secondary reasoning model; carries its own litellm cost entry.
-KIMI_K2_5_MODEL = "moonshotai/kimi-k2.5"
+# Website replacements verified against OpenRouter on 2026-09-08.
+GPT_6_ASTRA_MODEL = "openai/gpt-6-astra"
+GPT_6_ASTRA_PRO_MODEL = "openai/gpt-6-astra-pro"
+CLAUDE_FABLE_5_1_MODEL = "anthropic/claude-fable-5.1"
+GEMINI_3_8_FLASH_MODEL = "google/gemini-3.8-flash"
+QWEN_3_8_MAX_MODEL = "qwen/qwen3.8-max-0902"
+
+# Website replacements verified against OpenRouter on 2026-10-05.
+CLAUDE_OPUS_5_5_MODEL = "anthropic/claude-opus-5.5"
+CLAUDE_SONNET_5_5_MODEL = "anthropic/claude-sonnet-5.5"
+GPT_6_SOL_MODEL = "openai/gpt-6-sol"
+GPT_6_LUNA_MODEL = "openai/gpt-6-luna"
+GPT_6_1_SOL_MODEL = "openai/gpt-6.1-sol"
+GROK_4_7_MODEL = "x-ai/grok-4.7"
+GLM_5_3_MODEL = "z-ai/glm-5.3"
+
+# Featured-model long-context pricing. OpenRouter raises both input and output
+# rates once a *single request* crosses the prompt-token threshold below. Keep
+# these alongside the canonical IDs so the Python cost gate, LiteLLM actual-cost
+# tracking, and web estimator can all price long papers per stage instead of
+# flattening them to the cheaper base rate. Verified from each model's
+# OpenRouter ``pricing.overrides`` metadata on 2026-07-30.
+LONG_CONTEXT_PRICING_TIERS: dict[str, dict[str, int | float]] = {
+    GPT_6_SOL_MODEL: {
+        "min_prompt_tokens": 272000,
+        "input_cost_per_token": 4e-06,
+        "output_cost_per_token": 1.5e-05,
+    },
+    GPT_6_LUNA_MODEL: {
+        "min_prompt_tokens": 272000,
+        "input_cost_per_token": 2e-07,
+        "output_cost_per_token": 7.5e-07,
+    },
+    GPT_6_1_SOL_MODEL: {
+        "min_prompt_tokens": 272000,
+        "input_cost_per_token": 4e-06,
+        "output_cost_per_token": 1.5e-05,
+    },
+    GROK_4_7_MODEL: {
+        "min_prompt_tokens": 200000,
+        "input_cost_per_token": 4e-06,
+        "output_cost_per_token": 1.2e-05,
+    },
+    GPT_6_ASTRA_MODEL: {
+        "min_prompt_tokens": 272_000,
+        "input_cost_per_token": 20e-6,
+        "output_cost_per_token": 75e-6,
+    },
+    GPT_6_ASTRA_PRO_MODEL: {
+        "min_prompt_tokens": 272_000,
+        "input_cost_per_token": 20e-6,
+        "output_cost_per_token": 75e-6,
+    },
+    GPT_5_6_SOL_MODEL: {
+        "min_prompt_tokens": 272_000,
+        "input_cost_per_token": 10e-6,
+        "output_cost_per_token": 45e-6,
+    },
+    # Same tier as base Sol — OpenRouter reports identical pricing for the
+    # -pro variant (verified 2026-08-30).
+    GPT_5_6_SOL_PRO_MODEL: {
+        "min_prompt_tokens": 272_000,
+        "input_cost_per_token": 10e-6,
+        "output_cost_per_token": 45e-6,
+    },
+    GPT_5_6_TERRA_MODEL: {
+        "min_prompt_tokens": 272_000,
+        "input_cost_per_token": 2.5e-6,
+        "output_cost_per_token": 11.25e-6,
+    },
+    GPT_5_6_LUNA_MODEL: {
+        "min_prompt_tokens": 272_000,
+        "input_cost_per_token": 1e-6,
+        "output_cost_per_token": 4.5e-6,
+    },
+    QWEN_3_7_PLUS_MODEL: {
+        "min_prompt_tokens": 256_000,
+        "input_cost_per_token": 0.96e-6,
+        "output_cost_per_token": 3.84e-6,
+    },
+    GROK_4_5_MODEL: {
+        "min_prompt_tokens": 200_000,
+        "input_cost_per_token": 4e-6,
+        "output_cost_per_token": 12e-6,
+    },
+}
+
+# Primary package/CLI review model (routed via OpenRouter for non-direct
+# providers). The website intentionally starts on Opus 5.5 instead; this cheaper
+# package default keeps local runs accessible.
+DEFAULT_MODEL = QWEN_3_7_PLUS_MODEL
+
+# OpenRouter Fusion — a multi-model deliberation meta-model (a panel of expert
+# models runs the prompt in parallel with web search, then a synthesizer
+# combines them). Available as a selectable review model. Two things make it a
+# special case:
+#
+#   1. Routing. Its canonical OpenRouter slug lives under the ``openrouter/``
+#      *vendor* namespace (``openrouter/fusion``), which collides with the
+#      ``openrouter/`` prefix litellm uses for provider routing. litellm strips
+#      the leading prefix and would POST a bare ``fusion``, which OpenRouter
+#      rejects with a 502. The slug must therefore be doubled
+#      (``openrouter/openrouter/fusion``) before it reaches litellm — see
+#      ``OPENROUTER_NAMESPACE_MODELS`` and ``_normalize_model`` in ``llm.py``.
+#
+#   2. Pricing. OpenRouter reports dynamic pricing (``-1``) for Fusion because
+#      per-request cost depends on which panel models fire and how much web
+#      search runs. The representative per-token rates below were measured from
+#      real calls on 2026-06-17 (billed input ~$5/M, output ~$25/M). They give
+#      the cost estimators a concrete, conservative number wherever OpenRouter's
+#      ``-1`` sentinel would otherwise produce a $0 or negative estimate.
+FUSION_MODEL = "openrouter/fusion"
+FUSION_INPUT_COST_PER_TOKEN = 5e-6
+FUSION_OUTPUT_COST_PER_TOKEN = 25e-6
+
+# Ordered public model-picker contract. The web app mirrors this tuple because
+# the Python package and Next.js app cannot import one another at runtime;
+# tests/test_models.py parses ModelPicker.tsx and fails on any drift, including
+# the selected default. Keep labels/providers in the web component, but keep
+# every canonical ID here.
+WEB_DEFAULT_MODEL = CLAUDE_OPUS_5_5_MODEL
+WEB_FEATURED_MODEL_IDS: tuple[str, ...] = (
+    CLAUDE_FABLE_5_1_MODEL,
+    CLAUDE_OPUS_5_5_MODEL,
+    CLAUDE_SONNET_5_5_MODEL,
+    GPT_6_ASTRA_MODEL,
+    GPT_6_ASTRA_PRO_MODEL,
+    GPT_6_1_SOL_MODEL,
+    GPT_6_SOL_MODEL,
+    GPT_6_LUNA_MODEL,
+    GEMINI_3_1_PRO_MODEL,
+    GEMINI_3_8_FLASH_MODEL,
+    QWEN_3_8_MAX_MODEL,
+    KIMI_K3_MODEL,
+    DEEPSEEK_V4_PRO_MODEL,
+    GROK_4_7_MODEL,
+    LLAMA_4_MAVERICK_MODEL,
+    GLM_5_3_MODEL,
+    FUSION_MODEL,
+)
+
+# OpenRouter meta-models whose canonical slug starts with ``openrouter/`` and so
+# must be doubled for litellm provider routing (see FUSION_MODEL note above).
+LITELLM_OPENROUTER_PREFIX = "openrouter/"
+OPENROUTER_NAMESPACE_MODELS: frozenset[str] = frozenset({FUSION_MODEL})
+
+# OpenRouter defines variant model IDs that the underlying provider's own API
+# does not recognize. When such a model routes DIRECT to OpenAI, the wire
+# request must use the provider's real model ID plus Responses API fields.
+# Maps variant ID → (direct model ID, Responses API request defaults). Keys
+# are bare canonical IDs, so an ``openrouter/``-prefixed (proxied) model can
+# never match — the OpenRouter route keeps sending the variant ID untouched.
+DIRECT_RESPONSES_MODEL_ALIASES: dict[str, tuple[str, dict[str, object]]] = {
+    GPT_5_6_SOL_PRO_MODEL: (
+        GPT_5_6_SOL_MODEL,
+        {"reasoning": {"mode": "pro"}, "store": False},
+    ),
+}
 
 # Vision model for post-extraction QA (multimodal, spot-checks Docling output)
 # litellm uses 'gemini/' prefix for Google AI Studio (not 'google/')
@@ -38,8 +216,11 @@ OPENROUTER_EXTRACTION_MODEL = "google/gemini-3-flash-preview"
 # litellm uses gemini/ prefix for Google AI Studio (not google/ which is Vertex AI)
 QUALITY_MODEL = "gemini/gemini-3-flash-preview"
 
-# Literature search via Perplexity Sonar Pro (web-grounded, returns citations)
+# Literature search via Perplexity (web-grounded, returns citations). Standard
+# reviews use Pro Search; the opt-in deep mode uses the multi-step Deep Research
+# model.
 LITERATURE_SEARCH_MODEL = "perplexity/sonar-pro-search"
+DEEP_LITERATURE_SEARCH_MODEL = "perplexity/sonar-deep-research"
 
 # Default host-specific model IDs for the headless CLI backends
 # (``coarse-review --host claude|codex|gemini``). These are NOT litellm
@@ -48,10 +229,20 @@ LITERATURE_SEARCH_MODEL = "perplexity/sonar-pro-search"
 # its own command line. Kept here so ``cli_review``, ``headless_review``,
 # and ``headless_clients`` all agree on the canonical default.
 HEADLESS_DEFAULT_MODELS: dict[str, str] = {
-    "claude": "claude-opus-4-6",
-    "codex": "gpt-5.4",
-    "gemini": "gemini-3.1-pro-preview",
+    "claude": CLAUDE_OPUS_5_5_MODEL.removeprefix("anthropic/").replace(".", "-"),
+    "codex": GPT_6_SOL_MODEL.removeprefix("openai/"),
+    "gemini": GEMINI_3_6_FLASH_MODEL.removeprefix("google/"),
 }
+
+# Highest Codex reasoning effort exposed through coarse's portable ``max``
+# selector. GPT-5.6 added native ``max``; GPT-5.5/5.4 top out at ``xhigh``.
+# Prefix matching also covers tier variants and dated snapshots.
+CODEX_MAX_EFFORT_BY_MODEL_PREFIX: tuple[tuple[str, str], ...] = (
+    ("gpt-6", "max"),
+    ("gpt-5.6", "max"),
+    ("gpt-5.5", "xhigh"),
+    ("gpt-5.4", "xhigh"),
+)
 
 # Recall evaluation judge (cheap model for YES/NO semantic matching)
 RECALL_JUDGE_MODEL = QUALITY_MODEL
@@ -97,6 +288,23 @@ REASONING_MODEL_PREFIXES: tuple[str, ...] = (
     # bare `gpt-5` covers direct-OpenAI-SDK IDs (gpt-5.4, gpt-5-mini, …).
     "openai/gpt-5",
     "gpt-5",
+    "openai/gpt-6",
+    "gpt-6",
+    GEMINI_3_8_FLASH_MODEL,
+    QWEN_3_8_MAX_MODEL,
+    # GLM 5.3 (including Flash) uses hidden reasoning before emitting JSON.
+    GLM_5_3_MODEL,
+    # Current adaptive/default-reasoning frontier models. OpenRouter reports
+    # reasoning support for Claude 5 (including Fable), Qwen 3.7 Plus, and
+    # Kimi K3, and mandatory reasoning for Gemini 3.6 Flash (verified
+    # 2026-07-29). Reserve hidden-token headroom and include that billable
+    # output in estimates rather than under-quoting these models.
+    CLAUDE_FABLE_5_MODEL,
+    CLAUDE_OPUS_5_MODEL,
+    CLAUDE_SONNET_5_MODEL,
+    GEMINI_3_6_FLASH_MODEL,
+    QWEN_3_7_PLUS_MODEL,
+    KIMI_K3_MODEL,
     # DeepSeek R-series (R1 and distills)
     "deepseek/deepseek-r",
     # xAI Grok 4 family — reasoning on by default. Grok 3 mini is also a
@@ -219,6 +427,8 @@ def model_filename_slug(model_id: str) -> str:
 # Keep this tuple tight — only add a model once a passed-temperature
 # request is confirmed to fail.
 TEMPERATURE_UNSUPPORTED_PREFIXES: tuple[str, ...] = (
+    "openai/gpt-6",
+    "gpt-6",
     # Opus 4.7 (reasoning-first, issue #162): dot / hyphen / Vertex / bare.
     "anthropic/claude-opus-4.7",  # OpenRouter form
     "anthropic/claude-opus-4-7",  # litellm direct-Anthropic form
@@ -245,9 +455,15 @@ TEMPERATURE_UNSUPPORTED_PREFIXES: tuple[str, ...] = (
     # (verified OpenRouter /api/v1/models 2026-06-09: supported_parameters has
     # no `temperature`). The name has no version dot, so the OpenRouter and
     # litellm Anthropic forms are identical.
-    "anthropic/claude-fable-5",  # OpenRouter / litellm Anthropic form
+    CLAUDE_FABLE_5_MODEL,  # OpenRouter / litellm Anthropic form
     "vertex_ai/claude-fable-5",  # Vertex AI form
     "claude-fable-5",  # bare Anthropic SDK / Bedrock-style ID
+    # Claude Sonnet 5 also omits temperature on OpenRouter (verified
+    # 2026-07-29). Opus 5 does support it, so do not gate the whole Claude 5
+    # family.
+    "anthropic/claude-sonnet-5",  # OpenRouter / litellm Anthropic form
+    "vertex_ai/claude-sonnet-5",  # Vertex AI form
+    "claude-sonnet-5",  # bare Anthropic SDK / Bedrock-style ID
 )
 
 
